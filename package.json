@@ -1,0 +1,11 @@
+{
+  "name": "chatgpt-tab-notifier",
+  "version": "5.0.0",
+  "private": true,
+  "scripts": {
+    "build": "node build-userscript.mjs",
+    "build:check": "node build-userscript.mjs --check",
+    "test": "node --test tests/*.test.mjs",
+    "verify": "npm run test && npm run build:check"
+  }
+}
