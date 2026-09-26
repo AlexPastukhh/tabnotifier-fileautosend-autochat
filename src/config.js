@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.4.2';
+  const SCRIPT_VERSION = '5.4.3';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -40,6 +40,8 @@
     'textarea[data-testid="composer-textarea"]',
     '#prompt-textarea',
     'textarea[name="prompt-textarea"]',
+    '[contenteditable="true"][role="textbox"]',
+    'textarea[role="textbox"]',
     'textarea[placeholder]'
   ]);
 

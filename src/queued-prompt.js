@@ -8,6 +8,11 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
   'use strict';
 
+  const FROM_COMPOSER_RETRY_MS = 90;
+  const FROM_COMPOSER_MAX_ATTEMPTS = 5;
+  const FROM_COMPOSER_CLEAR_MAX_ATTEMPTS = 4;
+  const QUEUE_SEND_CONFIRM_TIMEOUT_MS = 2200;
+
   function readComposerText(composer) {
     if (!composer) return '';
     if (typeof HTMLTextAreaElement !== 'undefined' && composer instanceof HTMLTextAreaElement) return composer.value || '';
@@ -106,12 +111,33 @@
     return Boolean(job.insertedSnapshotNormalized && current === job.insertedSnapshotNormalized);
   }
 
+  function shouldClearComposerTransfer(currentText, expectedNormalized) {
+    const current = normalizeComposerTextForOwnership(currentText);
+    const expected = normalizeComposerTextForOwnership(expectedNormalized);
+    return Boolean(current && expected && current === expected);
+  }
+
+  function evaluateQueueSendConfirmation({
+    generationActive = false,
+    clickedComposerConnected = false,
+    clickedComposerHasText = true
+  } = {}) {
+    if (generationActive) return { confirmed: true, reason: 'generation-started' };
+    if (clickedComposerConnected && !clickedComposerHasText) {
+      return { confirmed: true, reason: 'clicked-composer-consumed' };
+    }
+    return { confirmed: false, reason: 'waiting' };
+  }
+
   function createQueuedPromptController({ onChange = () => {} } = {}) {
     let items = [];
     let nextId = 1;
     let pending = null;
     let retryTimer = null;
     let statusTimer = null;
+    let composerTransferTimer = null;
+    let composerTransfer = null;
+    let transferSerial = 0;
     let jobSerial = 0;
     let lastStatus = '';
 
@@ -167,42 +193,127 @@
       return item.id;
     }
 
-    function addFromComposer() {
-      const composer = deps.findComposer();
-      if (!composer) {
-        setStatus('Не найдено обычное поле ChatGPT.');
+    function currentComposerContext() {
+      if (typeof deps.findComposerContext === 'function') {
+        const context = deps.findComposerContext();
+        if (context?.composer) return context;
+      }
+      const composer = deps.findComposer?.();
+      if (!composer) return null;
+      const container = composer.closest?.('form') || deps.findComposerForm?.() || null;
+      const sendButton = container ? deps.findSendButton?.(container) : null;
+      return { composer, container, form: container, sendButton };
+    }
+
+    function clearComposerTransferTimer() {
+      if (composerTransferTimer !== null) clearTimeout(composerTransferTimer);
+      composerTransferTimer = null;
+    }
+
+    function finishComposerTransfer(message, autoClearMs = 2200) {
+      clearComposerTransferTimer();
+      composerTransfer = null;
+      if (message) setStatus(message, autoClearMs);
+    }
+
+    function scheduleComposerTransfer(callback, transferId, delay = FROM_COMPOSER_RETRY_MS) {
+      clearComposerTransferTimer();
+      composerTransferTimer = setTimeout(() => {
+        composerTransferTimer = null;
+        if (!composerTransfer || composerTransfer.id !== transferId) return;
+        callback();
+      }, delay);
+    }
+
+    function attemptClearTransferredComposer(transferId, attempt = 0) {
+      const transfer = composerTransfer;
+      if (!transfer || transfer.id !== transferId || transfer.phase !== 'clear') return false;
+
+      const preferred = transfer.originalComposer;
+      let target = null;
+      if (preferred?.isConnected !== false && shouldClearComposerTransfer(readComposerText(preferred), transfer.expectedNormalized)) {
+        target = preferred;
+      } else {
+        const context = currentComposerContext();
+        const current = context?.composer;
+        if (current && shouldClearComposerTransfer(readComposerText(current), transfer.expectedNormalized)) target = current;
+      }
+
+      if (!target) {
+        if (attempt + 1 < FROM_COMPOSER_CLEAR_MAX_ATTEMPTS) {
+          scheduleComposerTransfer(() => attemptClearTransferredComposer(transferId, attempt + 1), transferId);
+          return false;
+        }
+        finishComposerTransfer('Текст добавлен в очередь. Поле ChatGPT успело измениться — я его не очищал.', 5500);
         return false;
       }
 
-      const rawText = readComposerText(composer);
-      const value = String(rawText || '').trim();
-      if (!value) {
-        setStatus('Обычное поле ChatGPT пустое.');
+      if (!setComposerText(target, '')) {
+        if (attempt + 1 < FROM_COMPOSER_CLEAR_MAX_ATTEMPTS) {
+          scheduleComposerTransfer(() => attemptClearTransferredComposer(transferId, attempt + 1), transferId);
+          return false;
+        }
+        finishComposerTransfer('Текст добавлен в очередь, но обычное поле ChatGPT не удалось очистить.', 5500);
+        return false;
+      }
+
+      const after = normalizeComposerTextForOwnership(readComposerText(target));
+      if (!after) {
+        finishComposerTransfer('Текст из ChatGPT добавлен в очередь.');
+        return true;
+      }
+
+      // Повторяем очистку только пока в поле всё ещё находится ровно тот текст,
+      // который уже скопирован в очередь. Новый пользовательский текст не трогаем.
+      if (after === transfer.expectedNormalized && attempt + 1 < FROM_COMPOSER_CLEAR_MAX_ATTEMPTS) {
+        scheduleComposerTransfer(() => attemptClearTransferredComposer(transferId, attempt + 1), transferId);
+        return false;
+      }
+
+      finishComposerTransfer('Текст добавлен в очередь. Поле ChatGPT изменилось во время очистки — новый текст оставлен.', 5500);
+      return false;
+    }
+
+    function attemptAddFromComposer(transferId, attempt = 0) {
+      const transfer = composerTransfer;
+      if (!transfer || transfer.id !== transferId || transfer.phase !== 'find') return false;
+
+      const context = currentComposerContext();
+      const composer = context?.composer;
+      const rawText = composer ? readComposerText(composer) : '';
+      const normalized = normalizeComposerTextForOwnership(rawText);
+
+      if (!composer || !normalized) {
+        if (attempt + 1 < FROM_COMPOSER_MAX_ATTEMPTS) {
+          scheduleComposerTransfer(() => attemptAddFromComposer(transferId, attempt + 1), transferId);
+          return false;
+        }
+        finishComposerTransfer(composer ? 'Обычное поле ChatGPT пустое.' : 'Не найдено обычное поле ChatGPT.', 4500);
         return false;
       }
 
       const id = add(rawText);
       if (!id) {
-        setStatus('Не удалось добавить текст из ChatGPT в очередь.');
+        finishComposerTransfer('Не удалось добавить текст из ChatGPT в очередь.', 4500);
         return false;
       }
 
-      // Сначала текст гарантированно попадает в нашу очередь, и только после этого
-      // очищаем штатный composer, чтобы при ошибке пользовательский текст не потерялся.
-      const cleared = setComposerText(composer, '');
-      const stillHasText = Boolean(normalizeComposerTextForOwnership(readComposerText(composer)));
-      if (!cleared || stillHasText) {
-        // Второй проход полезен для contenteditable, если редактор проигнорировал первый delete/input.
-        setComposerText(composer, '');
-      }
-
-      const finallyCleared = !normalizeComposerTextForOwnership(readComposerText(composer));
-      if (!finallyCleared) {
-        setStatus('Текст добавлен в очередь, но обычное поле ChatGPT не удалось очистить.', 5500);
-      } else {
-        setStatus('Текст из ChatGPT добавлен в очередь.', 2200);
-      }
+      transfer.phase = 'clear';
+      transfer.itemId = id;
+      transfer.originalComposer = composer;
+      transfer.expectedNormalized = normalized;
+      attemptClearTransferredComposer(transferId, 0);
       return true;
+    }
+
+    function addFromComposer() {
+      if (composerTransfer) {
+        setStatus('Перенос из поля ChatGPT уже выполняется.', 1800);
+        return false;
+      }
+      const transferId = ++transferSerial;
+      composerTransfer = { id: transferId, phase: 'find' };
+      return attemptAddFromComposer(transferId, 0);
     }
 
     function move(id, direction) {
@@ -254,8 +365,15 @@
       return true;
     }
 
+    function cancelComposerTransfer() {
+      clearComposerTransferTimer();
+      composerTransfer = null;
+      transferSerial += 1;
+    }
+
     function clear() {
       cancelPending();
+      cancelComposerTransfer();
       clearStatusTimer();
       items = [];
       lastStatus = '';
@@ -316,7 +434,10 @@
         insertedAt: 0,
         expectedNormalized: normalizeComposerTextForOwnership(value),
         insertedSnapshotNormalized: '',
-        clickedSnapshotNormalized: ''
+        clickedSnapshotNormalized: '',
+        clickedComposer: null,
+        clickedContainer: null,
+        clickedButton: null
       };
       lastStatus = '';
       emitChange();
@@ -333,25 +454,39 @@
         return failPending('Не удалось отправить: штатное поле или кнопка Send не стали готовы. Сообщение осталось в очереди.', job.jobId);
       }
 
-      const composer = deps.findComposer();
-      const form = composer?.closest?.('form') || deps.findComposerForm();
+      const context = currentComposerContext();
+      const composer = context?.composer;
+      const form = context?.container || context?.form || null;
+
+      if (job.phase === 'confirm') {
+        let generationActive = false;
+        try { generationActive = Boolean(typeof deps.isGenerating === 'function' && deps.isGenerating()); } catch (_) {}
+
+        const clickedComposer = job.clickedComposer;
+        const clickedComposerConnected = Boolean(clickedComposer && clickedComposer.isConnected !== false);
+        const clickedComposerHasText = clickedComposerConnected
+          ? Boolean(normalizeComposerTextForOwnership(readComposerText(clickedComposer)))
+          : true;
+        const confirmation = evaluateQueueSendConfirmation({
+          generationActive,
+          clickedComposerConnected,
+          clickedComposerHasText
+        });
+        if (confirmation.confirmed) return finishPendingSuccess(job);
+
+        if (now - job.clickedAt > QUEUE_SEND_CONFIRM_TIMEOUT_MS) {
+          return failPending('Send не удалось надёжно подтвердить. Сообщение сохранено в очереди.', job.jobId);
+        }
+        scheduleRetry(90);
+        return false;
+      }
+
       if (!composer || !form) {
         scheduleRetry(180);
         return false;
       }
 
       const currentText = readComposerText(composer).trim();
-
-      if (job.phase === 'confirm') {
-        // Подтверждаем отправку только по очистке штатного composer.
-        // Сравнение с исходной строкой ненадёжно: contenteditable нормализует переносы.
-        if (!currentText) return finishPendingSuccess(job);
-        if (now - job.clickedAt > 1400) {
-          return failPending('Send не подтвердился: текст остался в поле. Сообщение сохранено в очереди.', job.jobId);
-        }
-        scheduleRetry(90);
-        return false;
-      }
 
       if (!job.allowWhileGenerating && typeof deps.isGenerating === 'function' && deps.isGenerating()) {
         scheduleRetry(220);
@@ -390,7 +525,7 @@
       }
 
       // Ищем Send заново уже ПОСЛЕ того, как ChatGPT получил input-событие.
-      const sendButton = deps.findSendButton(form) || deps.findSendButton(document);
+      const sendButton = context?.sendButton || deps.findSendButton(form);
       if (!deps.isSendButtonReady(sendButton)) {
         scheduleRetry(100);
         return false;
@@ -400,6 +535,9 @@
       job.phase = 'confirm';
       job.clickedAt = Date.now();
       job.clickedSnapshotNormalized = normalizeComposerTextForOwnership(currentText);
+      job.clickedComposer = composer;
+      job.clickedContainer = form;
+      job.clickedButton = sendButton;
       sendButton.click();
       scheduleRetry(90);
       return true;
@@ -466,5 +604,12 @@
     };
   }
 
-  return { readComposerText, setComposerText, createQueuedPromptController };
+  return {
+    readComposerText,
+    setComposerText,
+    normalizeComposerTextForOwnership,
+    shouldClearComposerTransfer,
+    evaluateQueueSendConfirmation,
+    createQueuedPromptController
+  };
 });
