@@ -21,13 +21,19 @@
   }
 
   function findComposer(doc = document) {
+    // ChatGPT often keeps hidden fallback textareas in the DOM. Prefer the
+    // largest visible candidate so a stale/hidden textarea cannot win.
+    const candidates = [];
     for (const selector of deps.COMPOSER_SELECTORS) {
-      const element = doc.querySelector(selector);
-      if (!element) continue;
-      const rect = element.getBoundingClientRect?.();
-      if (rect && rect.width > 20 && rect.height > 10) return element;
+      for (const element of doc.querySelectorAll(selector)) {
+        if (!isVisible(element)) continue;
+        const rect = element.getBoundingClientRect?.();
+        if (!rect || rect.width <= 20 || rect.height <= 10) continue;
+        candidates.push({ element, area: rect.width * rect.height });
+      }
     }
-    return null;
+    candidates.sort((a, b) => b.area - a.area);
+    return candidates[0]?.element || null;
   }
 
   function findSendButton(root = document) {
@@ -53,15 +59,25 @@
     const composer = findComposer(doc);
     const composerForm = composer?.closest?.('form');
     if (composerForm) return composerForm;
+
+    // Some current ChatGPT layouts wrap the editor in a composer container
+    // that is not the editor's direct form ancestor. Walk upward and accept
+    // a container that also owns the send/attach controls.
+    let node = composer?.parentElement;
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      if (node.querySelector?.('[data-testid="composer-plus-btn"], #composer-submit-button, [data-testid="send-button"], input#upload-files')) {
+        return node;
+      }
+    }
     return findSendButton(doc)?.closest?.('form') || null;
   }
 
   function findComposerBox(composer) {
     if (!composer) return null;
-    const form = composer.closest?.('form');
+    const form = composer.closest?.('form') || findComposerForm();
     if (form) {
       const rect = form.getBoundingClientRect?.();
-      if (rect && rect.width >= 180 && rect.height >= 35 && rect.height <= 320) return rect;
+      if (rect && rect.width >= 180 && rect.height >= 35 && rect.height <= 420) return rect;
     }
 
     const sendSelector = [
@@ -90,6 +106,7 @@
       'button[data-testid="composer-plus-btn"]',
       'button[data-testid*="composer-plus" i]',
       'button[aria-label*="Add photos" i]',
+      'button[aria-label="Add files and more" i]',
       'button[aria-label*="Add files" i]',
       'button[aria-label*="Attach" i]',
       'button[aria-label*="Добавить фото" i]',
@@ -99,6 +116,22 @@
     for (const selector of selectors) {
       const button = form.querySelector(selector);
       if (button && isVisible(button)) return button;
+    }
+    return null;
+  }
+
+
+  function findUploadFileInput(composer) {
+    const root = composer?.closest?.('form') || findComposerForm() || document;
+    const selectors = [
+      'input#upload-files[type="file"]',
+      'input#upload-photos[type="file"]',
+      'input[type="file"][multiple]',
+      'input[type="file"]'
+    ];
+    for (const selector of selectors) {
+      const input = root.querySelector?.(selector) || document.querySelector(selector);
+      if (input) return input;
     }
     return null;
   }
@@ -189,6 +222,7 @@
     findComposerForm,
     findComposerBox,
     findComposerPlusButton,
+    findUploadFileInput,
     chooseUploadPosition,
     getInputFileNames,
     composerHasAttachmentEvidence,
