@@ -34,7 +34,7 @@
     return Boolean(document.querySelector(selectors.join(',')));
   }
 
-  function createResponseMonitor({ tabState, notifications, beforeArm = () => {} }) {
+  function createResponseMonitor({ tabState, notifications, beforeArm = () => {}, onFinished = () => {} }) {
     let armed = false;
     let sawGenerating = false;
     let runId = 0;
@@ -107,6 +107,7 @@
       const unread = document.hidden || !document.hasFocus();
       tabState.setState(unread ? 'fresh' : 'viewed');
       notifications.notifyFinished();
+      try { onFinished(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка действия после завершения ответа:', error); }
     }
 
     function scheduleFinish() {

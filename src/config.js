@@ -5,6 +5,8 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
+  const SCRIPT_VERSION = '5.4.0';
+
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
     notifyOnlyInBackground: false,
@@ -75,6 +77,7 @@
   ]);
 
   return {
+    SCRIPT_VERSION,
     SETTINGS,
     SYMBOLS,
     ALL_PREFIX_SYMBOLS,

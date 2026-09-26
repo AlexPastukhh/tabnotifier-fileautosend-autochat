@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.2.1
-// @description  Статусы вкладки + автоотправка после загрузки вложений + системное уведомление
+// @version      5.4.0
+// @description  Статусы вкладки + автоотправка файлов + очередь сообщений + перетаскиваемые кнопки
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-idle
@@ -20,6 +20,8 @@
   root.ChatGPTTabNotifier = Object.assign(root.ChatGPTTabNotifier || {}, api);
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
+
+  const SCRIPT_VERSION = '5.4.0';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -91,6 +93,7 @@
   ]);
 
   return {
+    SCRIPT_VERSION,
     SETTINGS,
     SYMBOLS,
     ALL_PREFIX_SYMBOLS,
@@ -382,8 +385,9 @@
     if (!isElement(target)) return false;
     const button = target.closest('button');
     if (!button || button.disabled || !button.matches(deps.SEND_BUTTON_SELECTORS.join(','))) return false;
-    const form = button.closest('form');
-    return Boolean(form && deps.COMPOSER_SELECTORS.some(selector => form.querySelector(selector)));
+    if (button.matches('[data-testid="stop-button"], [data-testid="stop-generating-button"]')) return false;
+    const container = button.closest('form') || findComposerForm();
+    return Boolean(container && deps.COMPOSER_SELECTORS.some(selector => container.querySelector?.(selector)));
   }
 
   return {
@@ -730,6 +734,477 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
   'use strict';
 
+  function readComposerText(composer) {
+    if (!composer) return '';
+    if (typeof HTMLTextAreaElement !== 'undefined' && composer instanceof HTMLTextAreaElement) return composer.value || '';
+    if (typeof HTMLInputElement !== 'undefined' && composer instanceof HTMLInputElement) return composer.value || '';
+    return String(composer.innerText || composer.textContent || '').replace(/\u00a0/g, ' ');
+  }
+
+  function setNativeValue(element, value) {
+    const proto = typeof HTMLTextAreaElement !== 'undefined' && element instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : (typeof HTMLInputElement !== 'undefined' && element instanceof HTMLInputElement ? HTMLInputElement.prototype : null);
+    const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+
+  function dispatchComposerInput(element, value) {
+    try {
+      element.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        composed: true,
+        inputType: 'insertText',
+        data: value
+      }));
+    } catch (_) {
+      element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    }
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function setContentEditableValue(element, value) {
+    element.focus();
+    let inserted = false;
+    try {
+      const selection = window.getSelection?.();
+      if (selection) {
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      if (typeof document.execCommand === 'function') {
+        inserted = Boolean(document.execCommand('insertText', false, value));
+      }
+    } catch (_) {}
+
+    if (!inserted) {
+      element.replaceChildren();
+      const lines = String(value).split('\n');
+      lines.forEach((line, index) => {
+        const paragraph = document.createElement('p');
+        if (line) paragraph.textContent = line;
+        else paragraph.appendChild(document.createElement('br'));
+        element.appendChild(paragraph);
+        if (index === lines.length - 1 && lines.length === 1 && !line) paragraph.appendChild(document.createElement('br'));
+      });
+    }
+
+    // Даже execCommand не всегда синхронизирует внутреннее состояние редактора ChatGPT.
+    // Явно уведомляем интерфейс, чтобы штатный Send успел активироваться.
+    dispatchComposerInput(element, value);
+    return true;
+  }
+
+  function setComposerText(composer, value) {
+    if (!composer) return false;
+    if (
+      (typeof HTMLTextAreaElement !== 'undefined' && composer instanceof HTMLTextAreaElement) ||
+      (typeof HTMLInputElement !== 'undefined' && composer instanceof HTMLInputElement)
+    ) return setNativeValue(composer, value);
+    if (composer.isContentEditable || composer.getAttribute?.('contenteditable') === 'true') return setContentEditableValue(composer, value);
+    return false;
+  }
+
+  // contenteditable ChatGPT может менять представление переносов строк после вставки.
+  // Для проверки принадлежности текста сравниваем не сырой innerText, а каноническую форму.
+  function normalizeComposerTextForOwnership(value) {
+    return String(value || '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/ *\n */g, '\n')
+      .replace(/\n+/g, '\n')
+      .trim();
+  }
+
+  function composerTextBelongsToJob(currentText, job) {
+    if (!job?.insertedByScript) return false;
+    const current = normalizeComposerTextForOwnership(currentText);
+    if (!current) return false;
+    if (current === job.expectedNormalized) return true;
+    return Boolean(job.insertedSnapshotNormalized && current === job.insertedSnapshotNormalized);
+  }
+
+  function createQueuedPromptController({ onChange = () => {} } = {}) {
+    let items = [];
+    let nextId = 1;
+    let pending = null;
+    let retryTimer = null;
+    let statusTimer = null;
+    let jobSerial = 0;
+    let lastStatus = '';
+
+    function emitChange() {
+      try { onChange(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка обновления UI очереди:', error); }
+    }
+
+    function clearRetry() {
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+
+    function clearStatusTimer() {
+      if (statusTimer !== null) clearTimeout(statusTimer);
+      statusTimer = null;
+    }
+
+    function setStatus(message, autoClearMs = 4500) {
+      clearStatusTimer();
+      lastStatus = String(message || '');
+      emitChange();
+      if (lastStatus && autoClearMs > 0) {
+        statusTimer = setTimeout(() => {
+          statusTimer = null;
+          lastStatus = '';
+          emitChange();
+        }, autoClearMs);
+      }
+    }
+
+    function makeId() {
+      if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+      return `q-${Date.now().toString(36)}-${(nextId++).toString(36)}`;
+    }
+
+    function getItems() {
+      return items.map(item => ({ ...item }));
+    }
+
+    function getItem(id) {
+      return items.find(item => item.id === id) || null;
+    }
+
+    function add(text) {
+      const value = String(text || '').trim();
+      if (!value) return null;
+      const item = { id: makeId(), text: value, createdAt: Date.now() };
+      items.push(item);
+      clearStatusTimer();
+      lastStatus = '';
+      emitChange();
+      console.info(`[ChatGPT notifier] Добавлено в очередь. Элементов: ${items.length}`);
+      return item.id;
+    }
+
+    function addFromComposer() {
+      const composer = deps.findComposer();
+      if (!composer) {
+        setStatus('Не найдено обычное поле ChatGPT.');
+        return false;
+      }
+
+      const rawText = readComposerText(composer);
+      const value = String(rawText || '').trim();
+      if (!value) {
+        setStatus('Обычное поле ChatGPT пустое.');
+        return false;
+      }
+
+      const id = add(rawText);
+      if (!id) {
+        setStatus('Не удалось добавить текст из ChatGPT в очередь.');
+        return false;
+      }
+
+      // Сначала текст гарантированно попадает в нашу очередь, и только после этого
+      // очищаем штатный composer, чтобы при ошибке пользовательский текст не потерялся.
+      const cleared = setComposerText(composer, '');
+      const stillHasText = Boolean(normalizeComposerTextForOwnership(readComposerText(composer)));
+      if (!cleared || stillHasText) {
+        // Второй проход полезен для contenteditable, если редактор проигнорировал первый delete/input.
+        setComposerText(composer, '');
+      }
+
+      const finallyCleared = !normalizeComposerTextForOwnership(readComposerText(composer));
+      if (!finallyCleared) {
+        setStatus('Текст добавлен в очередь, но обычное поле ChatGPT не удалось очистить.', 5500);
+      } else {
+        setStatus('Текст из ChatGPT добавлен в очередь.', 2200);
+      }
+      return true;
+    }
+
+    function move(id, direction) {
+      if (pending) return false;
+      const index = items.findIndex(item => item.id === id);
+      if (index < 0) return false;
+      const target = index + Number(direction || 0);
+      if (target < 0 || target >= items.length || target === index) return false;
+      [items[index], items[target]] = [items[target], items[index]];
+      clearStatusTimer();
+      lastStatus = '';
+      emitChange();
+      return true;
+    }
+
+    function moveRelative(sourceId, targetId, placeAfter = false) {
+      if (pending || sourceId === targetId) return false;
+      const sourceIndex = items.findIndex(item => item.id === sourceId);
+      if (sourceIndex < 0 || !items.some(item => item.id === targetId)) return false;
+
+      const [moved] = items.splice(sourceIndex, 1);
+      const targetIndex = items.findIndex(item => item.id === targetId);
+      if (targetIndex < 0) {
+        items.splice(Math.min(sourceIndex, items.length), 0, moved);
+        return false;
+      }
+
+      items.splice(targetIndex + (placeAfter ? 1 : 0), 0, moved);
+      clearStatusTimer();
+      lastStatus = '';
+      emitChange();
+      return true;
+    }
+
+    function cancelPending() {
+      clearRetry();
+      pending = null;
+      jobSerial += 1; // Инвалидирует уже запланированные callback старой операции.
+    }
+
+    function remove(id) {
+      const index = items.findIndex(item => item.id === id);
+      if (index < 0) return false;
+      if (pending?.itemIds?.includes(id)) cancelPending();
+      items.splice(index, 1);
+      clearStatusTimer();
+      lastStatus = '';
+      emitChange();
+      return true;
+    }
+
+    function clear() {
+      cancelPending();
+      clearStatusTimer();
+      items = [];
+      lastStatus = '';
+      emitChange();
+    }
+
+    function scheduleRetry(delay = 160) {
+      if (retryTimer !== null || !pending) return;
+      const jobId = pending.jobId;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        if (!pending || pending.jobId !== jobId) return;
+        attemptSend(jobId);
+      }, delay);
+    }
+
+    function failPending(message, expectedJobId = null) {
+      if (expectedJobId !== null && (!pending || pending.jobId !== expectedJobId)) return false;
+      clearRetry();
+      pending = null;
+      jobSerial += 1;
+      setStatus(message, 4500);
+      console.warn(`[ChatGPT notifier] ${message}`);
+      return false;
+    }
+
+    function finishPendingSuccess(job) {
+      if (!pending || pending.jobId !== job.jobId) return false;
+      const sentIds = new Set(job.itemIds);
+      clearRetry();
+      pending = null;
+      items = items.filter(item => !sentIds.has(item.id));
+      clearStatusTimer();
+      lastStatus = '';
+      emitChange();
+      console.info(`[ChatGPT notifier] Отправка из очереди (${job.source}) подтверждена:`, job.text);
+      return true;
+    }
+
+    function beginSend({ itemIds, text, allowWhileGenerating, source, timeoutMs }) {
+      const ids = Array.from(itemIds || []).filter(id => getItem(id));
+      const value = String(text || '').trim();
+      if (!ids.length || !value) return false;
+
+      cancelPending();
+      clearStatusTimer();
+      const jobId = ++jobSerial;
+      pending = {
+        jobId,
+        itemIds: ids,
+        text: value,
+        allowWhileGenerating: Boolean(allowWhileGenerating),
+        source: source || 'queue',
+        deadline: Date.now() + Math.max(1000, Number(timeoutMs) || 7000),
+        phase: 'prepare',
+        clickedAt: 0,
+        insertedByScript: false,
+        insertedAt: 0,
+        expectedNormalized: normalizeComposerTextForOwnership(value),
+        insertedSnapshotNormalized: '',
+        clickedSnapshotNormalized: ''
+      };
+      lastStatus = '';
+      emitChange();
+      return attemptSend(jobId);
+    }
+
+    function attemptSend(expectedJobId = null) {
+      if (!pending) return false;
+      const job = pending;
+      if (expectedJobId !== null && job.jobId !== expectedJobId) return false;
+
+      const now = Date.now();
+      if (now > job.deadline) {
+        return failPending('Не удалось отправить: штатное поле или кнопка Send не стали готовы. Сообщение осталось в очереди.', job.jobId);
+      }
+
+      const composer = deps.findComposer();
+      const form = composer?.closest?.('form') || deps.findComposerForm();
+      if (!composer || !form) {
+        scheduleRetry(180);
+        return false;
+      }
+
+      const currentText = readComposerText(composer).trim();
+
+      if (job.phase === 'confirm') {
+        // Подтверждаем отправку только по очистке штатного composer.
+        // Сравнение с исходной строкой ненадёжно: contenteditable нормализует переносы.
+        if (!currentText) return finishPendingSuccess(job);
+        if (now - job.clickedAt > 1400) {
+          return failPending('Send не подтвердился: текст остался в поле. Сообщение сохранено в очереди.', job.jobId);
+        }
+        scheduleRetry(90);
+        return false;
+      }
+
+      if (!job.allowWhileGenerating && typeof deps.isGenerating === 'function' && deps.isGenerating()) {
+        scheduleRetry(220);
+        return false;
+      }
+
+      const ownsCurrentText = composerTextBelongsToJob(currentText, job);
+
+      if (currentText && !ownsCurrentText && normalizeComposerTextForOwnership(currentText) !== job.expectedNormalized) {
+        // Только текст, который НЕ принадлежит текущей операции, считаем пользовательским.
+        if (job.source.startsWith('manual-')) {
+          return failPending('Не отправлено: обычное поле ChatGPT уже содержит другой текст. Сообщение осталось в очереди.', job.jobId);
+        }
+        scheduleRetry(250);
+        return false;
+      }
+
+      if (!currentText || (!ownsCurrentText && normalizeComposerTextForOwnership(currentText) !== job.expectedNormalized)) {
+        if (!setComposerText(composer, job.text)) {
+          scheduleRetry(140);
+          return false;
+        }
+        job.insertedByScript = true;
+        job.insertedAt = Date.now();
+        job.insertedSnapshotNormalized = normalizeComposerTextForOwnership(readComposerText(composer));
+        scheduleRetry(90);
+        return false;
+      }
+
+      // Если редактор преобразовал два переноса в один и т.п., но это всё ещё наш текст,
+      // не трактуем его как чужой и продолжаем к штатной кнопке Send.
+      if (!job.insertedByScript && normalizeComposerTextForOwnership(currentText) === job.expectedNormalized) {
+        job.insertedByScript = true;
+        job.insertedAt = Date.now();
+        job.insertedSnapshotNormalized = normalizeComposerTextForOwnership(currentText);
+      }
+
+      // Ищем Send заново уже ПОСЛЕ того, как ChatGPT получил input-событие.
+      const sendButton = deps.findSendButton(form) || deps.findSendButton(document);
+      if (!deps.isSendButtonReady(sendButton)) {
+        scheduleRetry(100);
+        return false;
+      }
+
+      console.info(`[ChatGPT notifier] Нажимаю штатный Send (${job.source}):`, job.text);
+      job.phase = 'confirm';
+      job.clickedAt = Date.now();
+      job.clickedSnapshotNormalized = normalizeComposerTextForOwnership(currentText);
+      sendButton.click();
+      scheduleRetry(90);
+      return true;
+    }
+
+    function handleResponseFinished() {
+      if (pending || !items.length) return false;
+      const first = items[0];
+      return beginSend({
+        itemIds: [first.id],
+        text: first.text,
+        allowWhileGenerating: false,
+        source: 'auto-after-response',
+        timeoutMs: 10000
+      });
+    }
+
+    function sendNow(id) {
+      const item = getItem(id);
+      if (!item) return false;
+      return beginSend({
+        itemIds: [item.id],
+        text: item.text,
+        allowWhileGenerating: true,
+        source: 'manual-item',
+        timeoutMs: 3500
+      });
+    }
+
+    function sendAllNow() {
+      if (!items.length) return false;
+      const snapshot = items.map(item => ({ ...item }));
+      return beginSend({
+        itemIds: snapshot.map(item => item.id),
+        text: snapshot.map(item => item.text).join('\n\n'),
+        allowWhileGenerating: true,
+        source: 'manual-all',
+        timeoutMs: 3500
+      });
+    }
+
+    function resetForNavigation() {
+      clear();
+    }
+
+    return {
+      add,
+      addFromComposer,
+      move,
+      moveRelative,
+      remove,
+      clear,
+      attemptSend,
+      handleResponseFinished,
+      sendNow,
+      sendAllNow,
+      resetForNavigation,
+      getItems,
+      getCount: () => items.length,
+      hasQueued: () => items.length > 0,
+      isWaitingToSend: () => Boolean(pending),
+      getPendingIds: () => pending ? [...pending.itemIds] : [],
+      getLastStatus: () => lastStatus
+    };
+  }
+
+  return { readComposerText, setComposerText, createQueuedPromptController };
+});
+
+(function (root, factory) {
+  const deps = typeof require === 'function'
+    ? Object.assign({}, require('./config.js'), require('./chatgpt-dom.js'), root.ChatGPTTabNotifier || {})
+    : (root.ChatGPTTabNotifier || {});
+  const api = factory(deps);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  root.ChatGPTTabNotifier = Object.assign(root.ChatGPTTabNotifier || {}, api);
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
+  'use strict';
+
   const UI_WIDTH = 74;
   const UI_HEIGHT = 34;
   const VIEWPORT_MARGIN = 6;
@@ -744,10 +1219,11 @@
     };
   }
 
-  function createUploadButtonUi({ tabState, uploadController }) {
+  function createUploadButtonUi({ tabState, uploadController, queuedPromptController }) {
     let repositionTimer = null;
     let suppressClickUntil = 0;
     let dragState = null;
+    let draggedItemId = null;
 
     function viewportSize() {
       return {
@@ -795,14 +1271,168 @@
       return true;
     }
 
+    function positionPanel(host, panel) {
+      if (!panel || panel.hidden) return;
+      const viewport = viewportSize();
+      const hostRect = host.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const panelWidth = Math.min(panelRect.width || 430, Math.max(240, viewport.width - 24));
+      const panelHeight = panelRect.height || 330;
+
+      let left = 0;
+      if (hostRect.left + panelWidth > viewport.width - 12) {
+        left = viewport.width - 12 - hostRect.left - panelWidth;
+      }
+      left = Math.max(12 - hostRect.left, left);
+      panel.style.left = `${Math.round(left)}px`;
+
+      if (hostRect.top >= panelHeight + 12) {
+        panel.style.top = 'auto';
+        panel.style.bottom = '44px';
+      } else {
+        panel.style.bottom = 'auto';
+        panel.style.top = '44px';
+      }
+    }
+
+    function renderQueueList(ui) {
+      const controller = queuedPromptController;
+      if (!controller) return;
+
+      const items = controller.getItems();
+      const pendingIds = new Set(controller.getPendingIds());
+      const sending = controller.isWaitingToSend();
+      ui.list.replaceChildren();
+
+      items.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'queue-item';
+        row.dataset.pending = String(pendingIds.has(item.id));
+
+        const drag = document.createElement('span');
+        drag.className = 'drag-handle';
+        drag.textContent = '☰';
+        drag.title = 'Перетащить сообщение';
+        drag.draggable = !sending;
+
+        const number = document.createElement('span');
+        number.className = 'number';
+        number.textContent = String(index + 1);
+
+        const text = document.createElement('span');
+        text.className = 'queue-text';
+        text.textContent = item.text;
+        text.title = item.text;
+
+        const up = document.createElement('button');
+        up.type = 'button';
+        up.className = 'item-action';
+        up.textContent = '↑';
+        up.title = 'Переместить выше';
+        up.disabled = sending || index === 0;
+        up.addEventListener('click', () => queuedPromptController.move(item.id, -1));
+
+        const down = document.createElement('button');
+        down.type = 'button';
+        down.className = 'item-action';
+        down.textContent = '↓';
+        down.title = 'Переместить ниже';
+        down.disabled = sending || index === items.length - 1;
+        down.addEventListener('click', () => queuedPromptController.move(item.id, 1));
+
+        const send = document.createElement('button');
+        send.type = 'button';
+        send.className = 'item-action send-one';
+        send.textContent = pendingIds.has(item.id) ? '…' : '▶';
+        send.title = 'Отправить это сообщение сейчас через обычное поле ChatGPT';
+        send.disabled = sending;
+        send.addEventListener('click', () => queuedPromptController.sendNow(item.id));
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'item-action remove';
+        remove.textContent = '×';
+        remove.title = 'Удалить из очереди';
+        remove.disabled = pendingIds.has(item.id);
+        remove.addEventListener('click', () => queuedPromptController.remove(item.id));
+
+        drag.addEventListener('dragstart', event => {
+          if (sending) { event.preventDefault(); return; }
+          draggedItemId = item.id;
+          row.dataset.dragging = 'true';
+          try { event.dataTransfer.effectAllowed = 'move'; } catch (_) {}
+        });
+        drag.addEventListener('dragend', () => {
+          draggedItemId = null;
+          row.dataset.dragging = 'false';
+          for (const element of ui.list.querySelectorAll('.queue-item')) delete element.dataset.drop;
+        });
+        row.addEventListener('dragover', event => {
+          if (!draggedItemId || draggedItemId === item.id || sending) return;
+          event.preventDefault();
+          const rect = row.getBoundingClientRect();
+          row.dataset.drop = event.clientY >= rect.top + rect.height / 2 ? 'after' : 'before';
+          try { event.dataTransfer.dropEffect = 'move'; } catch (_) {}
+        });
+        row.addEventListener('dragleave', event => {
+          if (!row.contains(event.relatedTarget)) delete row.dataset.drop;
+        });
+        row.addEventListener('drop', event => {
+          if (!draggedItemId || draggedItemId === item.id || sending) return;
+          event.preventDefault();
+          const placeAfter = row.dataset.drop === 'after';
+          queuedPromptController.moveRelative(draggedItemId, item.id, placeAfter);
+          draggedItemId = null;
+        });
+
+        row.append(drag, number, text, up, down, send, remove);
+        ui.list.appendChild(row);
+      });
+
+      ui.empty.style.display = items.length ? 'none' : 'block';
+      ui.sendAll.style.display = items.length ? 'block' : 'none';
+      ui.sendAll.disabled = sending;
+      ui.add.disabled = sending;
+      ui.fromChat.disabled = sending;
+      ui.sendAll.textContent = items.length > 1
+        ? `Отправить всё одним сообщением (${items.length})`
+        : 'Отправить всё одним сообщением';
+
+      const status = controller.getLastStatus();
+      ui.status.textContent = status;
+      ui.status.style.display = status ? 'block' : 'none';
+
+      const count = controller.getCount();
+      ui.badge.textContent = String(count);
+      ui.badge.style.display = count ? 'flex' : 'none';
+      ui.queueButton.dataset.active = String(count > 0);
+      ui.queueButton.dataset.sending = String(sending);
+      ui.queueButton.title = sending
+        ? `ChatGPT notifier v${deps.SCRIPT_VERSION} · Очередь: ${count}. Сейчас выполняется отправка.`
+        : count
+          ? `ChatGPT notifier v${deps.SCRIPT_VERSION} · Очередь сообщений: ${count}`
+          : `ChatGPT notifier v${deps.SCRIPT_VERSION} · Открыть очередь сообщений`;
+    }
+
     function ensureUi() {
       let host = document.getElementById(deps.UPLOAD_HOST_ID);
       if (host?.shadowRoot) {
         return {
           host,
           row: host.shadowRoot.querySelector('.row'),
+          queueButton: host.shadowRoot.querySelector('[data-role="queue"]'),
           autoButton: host.shadowRoot.querySelector('[data-role="auto-send"]'),
-          plusButton: host.shadowRoot.querySelector('[data-role="fallback-plus"]')
+          badge: host.shadowRoot.querySelector('.badge'),
+          panel: host.shadowRoot.querySelector('.panel'),
+          list: host.shadowRoot.querySelector('.queue-list'),
+          empty: host.shadowRoot.querySelector('.empty'),
+          status: host.shadowRoot.querySelector('.status'),
+          sendAll: host.shadowRoot.querySelector('.send-all'),
+          textarea: host.shadowRoot.querySelector('textarea'),
+          add: host.shadowRoot.querySelector('.add'),
+          fromChat: host.shadowRoot.querySelector('.from-chat'),
+          versionChip: host.shadowRoot.querySelector('.version-chip'),
+          panelVersion: host.shadowRoot.querySelector('.panel-version')
         };
       }
 
@@ -811,7 +1441,7 @@
       host.id = deps.UPLOAD_HOST_ID;
       Object.assign(host.style, {
         position: 'fixed', left: '16px', top: '16px', width: `${UI_WIDTH}px`, height: `${UI_HEIGHT}px`,
-        zIndex: '2147483646', pointerEvents: 'auto', display: 'block'
+        zIndex: '2147483646', pointerEvents: 'auto', display: 'block', overflow: 'visible'
       });
       document.documentElement.appendChild(host);
 
@@ -819,37 +1449,162 @@
       shadow.innerHTML = `
         <style>
           :host { all: initial; }
+          * { box-sizing: border-box; }
           .row {
             display:flex; gap:6px; align-items:center; width:${UI_WIDTH}px; height:${UI_HEIGHT}px;
-            pointer-events:auto; touch-action:none; user-select:none; cursor:grab;
+            pointer-events:auto; touch-action:none; user-select:none; cursor:grab; position:relative;
           }
           .row[data-dragging="true"] { cursor:grabbing; }
-          button {
+          .control {
             width:34px; height:34px; padding:0; border-radius:999px;
             border:1px solid rgba(128,128,128,.24); background:rgba(32,32,32,.88);
             color:#fff; font:16px/1 system-ui,sans-serif; display:inline-flex;
-            align-items:center; justify-content:center; cursor:inherit; box-sizing:border-box;
+            align-items:center; justify-content:center; cursor:inherit;
             pointer-events:auto; box-shadow:0 2px 10px rgba(0,0,0,.24);
             -webkit-user-select:none; user-select:none;
           }
-          button:hover { filter:brightness(1.12); }
-          button[data-active="true"] {
-            background:#2563eb; border-color:#2563eb; opacity:1;
+          .control:hover { filter:brightness(1.12); }
+          .control[data-active="true"] { opacity:1; }
+          [data-role="auto-send"][data-active="true"] {
+            background:#2563eb; border-color:#2563eb;
             box-shadow:0 0 0 2px rgba(37,99,235,.18),0 2px 10px rgba(0,0,0,.24);
           }
-          button[data-active="false"] { opacity:.72; }
-          [data-role="fallback-plus"] { font-size:24px; font-weight:300; }
+          [data-role="auto-send"][data-active="false"] { opacity:.72; }
+          [data-role="queue"] { font-size:24px; font-weight:300; position:relative; }
+          [data-role="queue"][data-active="true"] { background:#383838; border-color:rgba(255,255,255,.25); }
+          [data-role="queue"][data-sending="true"] { animation:pulse .8s ease-in-out infinite alternate; }
+          @keyframes pulse { from { opacity:.62; } to { opacity:1; } }
+          .badge {
+            position:absolute; left:24px; top:-7px; min-width:17px; height:17px; padding:0 4px;
+            display:none; align-items:center; justify-content:center; border-radius:10px;
+            background:#6d5dfc; color:#fff; font:600 10px/1 system-ui,sans-serif;
+            pointer-events:none; box-shadow:0 1px 4px rgba(0,0,0,.35);
+          }
+          .version-chip {
+            position:absolute; left:0; top:-22px; height:17px; padding:0 6px;
+            display:inline-flex; align-items:center; justify-content:center; white-space:nowrap;
+            border:1px solid rgba(128,128,128,.24); border-radius:999px;
+            background:rgba(32,32,32,.88); color:rgba(255,255,255,.62);
+            font:600 9px/1 system-ui,sans-serif; pointer-events:none;
+            box-shadow:0 2px 8px rgba(0,0,0,.18);
+          }
+          .panel {
+            position:absolute; left:0; bottom:44px; width:min(430px, calc(100vw - 24px));
+            pointer-events:auto; font:13px/1.35 system-ui,sans-serif; color:#fff;
+          }
+          .panel[hidden] { display:none; }
+          .panel-header {
+            display:flex; align-items:center; justify-content:space-between; gap:8px;
+            margin:0 0 7px; padding:7px 9px; border:1px solid rgba(128,128,128,.24);
+            border-radius:10px; background:rgba(40,40,40,.98);
+            color:rgba(255,255,255,.78); font:600 11px/1.2 system-ui,sans-serif;
+          }
+          .panel-version { color:rgba(255,255,255,.48); font-weight:700; }
+          .queue-list { max-height:220px; overflow-y:auto; margin-bottom:7px; scrollbar-width:thin; }
+          .queue-item {
+            display:flex; align-items:center; gap:7px; min-height:42px;
+            padding:7px 8px 7px 9px; margin-bottom:5px;
+            border:1px solid rgba(128,128,128,.28); border-radius:11px;
+            background:rgba(48,48,48,.98); box-shadow:0 4px 14px rgba(0,0,0,.22);
+          }
+          .queue-item[data-pending="true"] { border-color:rgba(109,93,252,.72); }
+          .queue-item[data-drop="before"] { box-shadow:inset 0 2px 0 #6d5dfc,0 4px 14px rgba(0,0,0,.22); }
+          .queue-item[data-drop="after"] { box-shadow:inset 0 -2px 0 #6d5dfc,0 4px 14px rgba(0,0,0,.22); }
+          .queue-item[data-dragging="true"] { opacity:.42; }
+          .drag-handle { width:18px; flex:0 0 18px; color:rgba(255,255,255,.34); cursor:grab; user-select:none; font:13px/1 system-ui,sans-serif; text-align:center; }
+          .drag-handle:active { cursor:grabbing; }
+          .number { width:18px; flex:0 0 18px; opacity:.46; font:11px/1 system-ui,sans-serif; text-align:center; }
+          .queue-text { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font:13px/1.35 system-ui,sans-serif; }
+          .item-action {
+            width:27px; height:27px; flex:0 0 27px; padding:0; border:0; border-radius:7px;
+            background:transparent; color:#aaa; font:14px/1 system-ui,sans-serif; cursor:pointer;
+          }
+          .item-action:hover:not(:disabled) { background:rgba(255,255,255,.10); color:#fff; }
+          .item-action.send-one:hover:not(:disabled) { background:rgba(109,93,252,.52); }
+          .item-action.remove:hover:not(:disabled) { background:rgba(127,45,45,.58); }
+          .item-action:disabled { opacity:.45; cursor:default; }
+          .empty { display:none; margin-bottom:7px; padding:9px; border:1px dashed rgba(128,128,128,.22); border-radius:10px; color:rgba(255,255,255,.38); text-align:center; }
+          .send-all {
+            display:none; width:100%; margin:0 0 7px; padding:8px 10px;
+            border:1px solid rgba(128,128,128,.28); border-radius:10px;
+            background:rgba(48,48,48,.98); color:#ddd; font:12px/1.2 system-ui,sans-serif;
+            cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,.16);
+          }
+          .send-all:hover:not(:disabled) { background:rgba(58,58,58,.98); color:#fff; }
+          .send-all:disabled { opacity:.5; cursor:default; }
+          .composer { padding:9px; border:1px solid rgba(128,128,128,.28); border-radius:14px; background:rgba(30,30,30,.98); box-shadow:0 12px 34px rgba(0,0,0,.34); }
+          textarea { display:block; width:100%; min-height:66px; max-height:190px; resize:vertical; padding:4px 4px 7px; border:0; outline:none; background:transparent; color:#fff; font:13px/1.42 system-ui,sans-serif; }
+          textarea::placeholder { color:rgba(255,255,255,.36); }
+          .composer-bottom { display:flex; align-items:center; gap:7px; }
+          .actions-left { display:flex; align-items:center; gap:7px; min-width:0; }
+          .hint { margin-left:auto; color:rgba(255,255,255,.32); font:10px/1 system-ui,sans-serif; white-space:nowrap; }
+          .add,.from-chat {
+            border:1px solid rgba(128,128,128,.28); border-radius:8px; padding:7px 11px; cursor:pointer;
+            background:rgba(48,48,48,.98); color:#eee; font:600 12px/1 system-ui,sans-serif; white-space:nowrap;
+          }
+          .add:hover,.from-chat:hover { background:rgba(64,64,64,.98); color:#fff; }
+          .from-chat { background:rgba(53,51,74,.98); border-color:rgba(109,93,252,.38); }
+          .from-chat:hover { background:rgba(72,68,101,.98); }
+          .add:disabled,.from-chat:disabled { opacity:.48; cursor:default; }
+          .status { display:none; margin:0 0 7px; padding:7px 9px; border-radius:9px; background:rgba(127,45,45,.38); color:#ffd7d7; font:11px/1.35 system-ui,sans-serif; }
         </style>
+
+        <div class="panel" hidden>
+          <div class="panel-header"><span>Очередь сообщений</span><span class="panel-version"></span></div>
+          <div class="status"></div>
+          <div class="empty">Очередь пуста</div>
+          <div class="queue-list"></div>
+          <button type="button" class="send-all">Отправить всё одним сообщением</button>
+          <div class="composer">
+            <textarea placeholder="Добавить следующее сообщение..."></textarea>
+            <div class="composer-bottom">
+              <div class="actions-left">
+                <button type="button" class="add">В очередь</button>
+                <button type="button" class="from-chat" title="Перенести весь текст из обычного поля ChatGPT в очередь">Из чата → очередь</button>
+              </div>
+              <span class="hint">Ctrl/⌘ + Enter</span>
+            </div>
+          </div>
+        </div>
+
         <div class="row" aria-label="ChatGPT notifier controls">
-          <button type="button" data-role="fallback-plus" aria-label="Добавить файлы">+</button>
-          <button type="button" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
+          <span class="version-chip"></span>
+          <button type="button" class="control" data-role="queue" aria-label="Очередь сообщений">+</button>
+          <button type="button" class="control" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
+          <span class="badge"></span>
         </div>`;
 
-      const row = shadow.querySelector('.row');
-      const autoButton = shadow.querySelector('[data-role="auto-send"]');
-      const plusButton = shadow.querySelector('[data-role="fallback-plus"]');
+      const ui = {
+        host,
+        row: shadow.querySelector('.row'),
+        queueButton: shadow.querySelector('[data-role="queue"]'),
+        autoButton: shadow.querySelector('[data-role="auto-send"]'),
+        badge: shadow.querySelector('.badge'),
+        panel: shadow.querySelector('.panel'),
+        list: shadow.querySelector('.queue-list'),
+        empty: shadow.querySelector('.empty'),
+        status: shadow.querySelector('.status'),
+        sendAll: shadow.querySelector('.send-all'),
+        textarea: shadow.querySelector('textarea'),
+        add: shadow.querySelector('.add'),
+        fromChat: shadow.querySelector('.from-chat'),
+        versionChip: shadow.querySelector('.version-chip'),
+        panelVersion: shadow.querySelector('.panel-version')
+      };
 
-      row.addEventListener('pointerdown', event => {
+      ui.versionChip.textContent = `v${deps.SCRIPT_VERSION}`;
+      ui.panelVersion.textContent = `v${deps.SCRIPT_VERSION}`;
+
+      function addCurrent() {
+        if (!queuedPromptController) return;
+        const id = queuedPromptController.add(ui.textarea.value);
+        if (!id) return;
+        ui.textarea.value = '';
+        render();
+        setTimeout(() => ui.textarea.focus(), 0);
+      }
+
+      ui.row.addEventListener('pointerdown', event => {
         if (event.button !== 0 || !event.isPrimary) return;
         const rect = host.getBoundingClientRect();
         dragState = {
@@ -862,58 +1617,73 @@
         };
       });
 
-      row.addEventListener('pointermove', event => {
+      ui.row.addEventListener('pointermove', event => {
         if (!dragState || dragState.pointerId !== event.pointerId) return;
         const dx = event.clientX - dragState.startX;
         const dy = event.clientY - dragState.startY;
         if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
         dragState.moved = true;
-        row.dataset.dragging = 'true';
-        // Capture only after this has become a real drag. Capturing on
-        // pointerdown retargets pointerup/click to the row in Chromium, so
-        // normal button clicks never reach the button click handlers.
-        row.setPointerCapture?.(event.pointerId);
+        ui.row.dataset.dragging = 'true';
+        ui.row.setPointerCapture?.(event.pointerId);
         event.preventDefault();
         setHostPosition(host, { left: dragState.startLeft + dx, top: dragState.startTop + dy });
+        positionPanel(host, ui.panel);
       });
 
       function finishDrag(event) {
         if (!dragState || dragState.pointerId !== event.pointerId) return;
         const moved = dragState.moved;
         dragState = null;
-        row.dataset.dragging = 'false';
-        try { row.releasePointerCapture?.(event.pointerId); } catch (_) {}
+        ui.row.dataset.dragging = 'false';
+        try { ui.row.releasePointerCapture?.(event.pointerId); } catch (_) {}
         if (!moved) return;
         event.preventDefault();
         suppressClickUntil = Date.now() + 350;
         const rect = host.getBoundingClientRect();
         setHostPosition(host, { left: rect.left, top: rect.top }, { persist: true });
+        positionPanel(host, ui.panel);
       }
 
-      row.addEventListener('pointerup', finishDrag);
-      row.addEventListener('pointercancel', finishDrag);
+      ui.row.addEventListener('pointerup', finishDrag);
+      ui.row.addEventListener('pointercancel', finishDrag);
 
-      autoButton.addEventListener('click', event => {
+      ui.queueButton.addEventListener('click', event => {
+        if (clickWasDrag(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        ui.panel.hidden = !ui.panel.hidden;
+        render();
+        if (!ui.panel.hidden) {
+          setTimeout(() => {
+            positionPanel(host, ui.panel);
+            ui.textarea.focus();
+          }, 0);
+        }
+      });
+
+      ui.autoButton.addEventListener('click', event => {
         if (clickWasDrag(event)) return;
         event.preventDefault();
         event.stopPropagation();
         uploadController.toggle();
       });
 
-      plusButton.addEventListener('click', event => {
-        if (clickWasDrag(event)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        const composer = deps.findComposer();
-        const nativePlus = deps.findComposerPlusButton(composer);
-        if (nativePlus) {
-          nativePlus.click();
+      ui.add.addEventListener('click', addCurrent);
+      ui.fromChat.addEventListener('click', () => queuedPromptController?.addFromComposer());
+      ui.sendAll.addEventListener('click', () => queuedPromptController?.sendAllNow());
+      ui.textarea.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          ui.panel.hidden = true;
           return;
         }
-        deps.findUploadFileInput(composer)?.click();
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          addCurrent();
+        }
       });
 
-      return { host, row, autoButton, plusButton };
+      return ui;
     }
 
     function render() {
@@ -934,7 +1704,11 @@
       ui.autoButton.title = active
         ? 'Жду окончания загрузки файлов и затем автоматически отправлю. Нажать ещё раз — отменить.'
         : 'Когда файлы загружаются: нажать, чтобы после завершения автоматически отправить сообщение';
-      ui.plusButton.title = 'Добавить файлы';
+
+      ui.versionChip.textContent = `v${deps.SCRIPT_VERSION}`;
+      ui.panelVersion.textContent = `v${deps.SCRIPT_VERSION}`;
+      renderQueueList(ui);
+      positionPanel(host, ui.panel);
     }
 
     function schedule() {
@@ -945,7 +1719,13 @@
       }, deps.SETTINGS.uiRepositionDelayMs);
     }
 
-    return { render, schedule };
+    function closeQueuePanel() {
+      const host = document.getElementById(deps.UPLOAD_HOST_ID);
+      const panel = host?.shadowRoot?.querySelector('.panel');
+      if (panel) panel.hidden = true;
+    }
+
+    return { render, schedule, closeQueuePanel };
   }
 
   return { clampFloatingPosition, createUploadButtonUi };
@@ -987,7 +1767,7 @@
     return Boolean(document.querySelector(selectors.join(',')));
   }
 
-  function createResponseMonitor({ tabState, notifications, beforeArm = () => {} }) {
+  function createResponseMonitor({ tabState, notifications, beforeArm = () => {}, onFinished = () => {} }) {
     let armed = false;
     let sawGenerating = false;
     let runId = 0;
@@ -1060,6 +1840,7 @@
       const unread = document.hidden || !document.hasFocus();
       tabState.setState(unread ? 'fresh' : 'viewed');
       notifications.notifyFinished();
+      try { onFinished(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка действия после завершения ответа:', error); }
     }
 
     function scheduleFinish() {
@@ -1116,9 +1897,16 @@
 
   function startTabNotifier() {
     let uploadUi = null;
-    const tabState = deps.createTabStateController({ scheduleUiUpdate: () => uploadUi?.schedule() });
-    const notifications = deps.createNotificationService(tabState);
     let uploadController = null;
+    let queuedPromptController = null;
+
+    function scheduleUi() {
+      uploadUi?.schedule();
+    }
+
+    const tabState = deps.createTabStateController({ scheduleUiUpdate: scheduleUi });
+    const notifications = deps.createNotificationService(tabState);
+
     const responseMonitor = deps.createResponseMonitor({
       tabState,
       notifications,
@@ -1126,11 +1914,13 @@
         if (tabState.isUploadMarked() || uploadController?.isArmed()) {
           uploadController?.reset({ clearMark: true, render: false });
         }
-      }
+      },
+      onFinished: () => queuedPromptController?.handleResponseFinished()
     });
 
     uploadController = deps.createUploadAutoSendController({ tabState });
-    uploadUi = deps.createUploadButtonUi({ tabState, uploadController });
+    queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
+    uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController });
     let lastUrl = location.href;
 
     document.addEventListener('change', event => {
@@ -1176,24 +1966,26 @@
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         markViewed();
-        uploadUi.schedule();
+        scheduleUi();
       }
     });
     window.addEventListener('focus', markViewed);
-    window.addEventListener('resize', uploadUi.schedule, { passive: true });
-    window.addEventListener('scroll', uploadUi.schedule, { passive: true, capture: true });
+    window.addEventListener('resize', scheduleUi, { passive: true });
+    window.addEventListener('scroll', scheduleUi, { passive: true, capture: true });
 
     function resetForNavigation() {
       lastUrl = location.href;
       responseMonitor.resetForNavigation();
       uploadController.reset({ clearMark: true, render: false });
       uploadController.resetFileHistory();
+      queuedPromptController.resetForNavigation();
+      uploadUi.closeQueuePanel?.();
       tabState.resetForNavigation();
       setTimeout(responseMonitor.check, 400);
     }
 
     const uiObserver = new MutationObserver(() => {
-      if (!document.hidden) uploadUi.schedule();
+      if (!document.hidden) scheduleUi();
       if (uploadController.isArmed()) uploadController.check();
     });
     uiObserver.observe(document.documentElement, {
@@ -1217,18 +2009,21 @@
       if (location.href !== lastUrl) resetForNavigation();
       responseMonitor.check();
       uploadController.check();
+      queuedPromptController.attemptSend();
       tickCount += 1;
-      if (!document.hidden && tickCount % 6 === 0) uploadUi.schedule();
+      if (!document.hidden && tickCount % 6 === 0) scheduleUi();
     }, deps.SETTINGS.checkIntervalMs);
 
     if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand(`ℹ Версия: v${deps.SCRIPT_VERSION}`, () => console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION}`));
       GM_registerMenuCommand('⇧ Автоотправка после загрузки файлов', uploadController.toggle);
       GM_registerMenuCommand('● Проверить уведомление', notifications.showDesktopNotification);
     }
 
     tabState.render();
     responseMonitor.check();
-    console.info('[ChatGPT notifier] v5.0 запущен. Исходники модульные; userscript собран автоматически.');
+    scheduleUi();
+    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: + открывает очередь сообщений, ⇧ управляет автоотправкой файлов.`);
 
     return {
       dispose() {
@@ -1237,6 +2032,7 @@
       },
       tabState,
       uploadController,
+      queuedPromptController,
       responseMonitor,
       uploadUi
     };
