@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.4.0';
+  const SCRIPT_VERSION = '5.4.1';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -19,7 +19,8 @@
     uploadReadyStableMs: 1500,
     uploadMinArmDelayMs: 900,
     uploadAutoSendTimeoutMs: 30 * 60 * 1000,
-    recentFileActivityWindowMs: 15 * 60 * 1000
+    recentFileActivityWindowMs: 15 * 60 * 1000,
+    uploadActivityFallbackWindowMs: 90 * 1000
   });
 
   const SYMBOLS = Object.freeze({ working: '⏳', fresh: '●', viewed: '✓', uploading: '⇧', idle: '' });

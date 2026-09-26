@@ -11,7 +11,7 @@
   const UI_WIDTH = 74;
   const UI_HEIGHT = 34;
   const VIEWPORT_MARGIN = 6;
-  const DRAG_THRESHOLD_PX = 4;
+  const DRAG_THRESHOLD_PX = 8;
 
   function clampFloatingPosition(position, viewportWidth, viewportHeight) {
     const maxLeft = Math.max(VIEWPORT_MARGIN, viewportWidth - UI_WIDTH - VIEWPORT_MARGIN);

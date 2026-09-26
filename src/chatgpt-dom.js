@@ -193,10 +193,45 @@
     return false;
   }
 
-  function composerHasUploadBusyEvidence(form) {
+  function elementHasUploadContext(element, form, knownFileNames = []) {
+    const names = Array.from(knownFileNames || []).map(name => String(name || '')).filter(Boolean);
+    let node = element;
+    for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+      if (!isElement(node)) break;
+      const metadata = [
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('title') || '',
+        node.getAttribute('data-testid') || '',
+        node.getAttribute('data-state') || '',
+        typeof node.className === 'string' ? node.className : ''
+      ].join(' ');
+      const text = String(node.textContent || '').slice(0, 1500);
+      const haystack = `${metadata} ${text}`;
+      if (/upload|attachment|file(?:-|_|\s)|загруз|файл/i.test(haystack)) return true;
+      if (names.some(name => haystack.includes(name))) return true;
+      if (node === form) break;
+    }
+    return false;
+  }
+
+  function composerHasUploadBusyEvidence(form, knownFileNames = []) {
     if (!isElement(form)) return false;
+    const genericBusySelector = [
+      '[aria-busy="true"]',
+      '[role="progressbar"]',
+      '[data-loading="true"]',
+      '[data-state="loading"]'
+    ].join(',');
+
     for (const selector of deps.UPLOAD_BUSY_SELECTORS) {
-      for (const element of form.querySelectorAll(selector)) if (isVisible(element)) return true;
+      for (const element of form.querySelectorAll(selector)) {
+        if (!isVisible(element)) continue;
+        // Upload-specific selectors remain authoritative. Generic loading/progress
+        // markers are considered upload-busy only when their nearby DOM has file
+        // context, otherwise unrelated composer UI can block auto-send forever.
+        if (!element.matches(genericBusySelector)) return true;
+        if (elementHasUploadContext(element, form, knownFileNames)) return true;
+      }
     }
     return false;
   }
