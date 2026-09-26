@@ -210,8 +210,9 @@
     if (!isElement(target)) return false;
     const button = target.closest('button');
     if (!button || button.disabled || !button.matches(deps.SEND_BUTTON_SELECTORS.join(','))) return false;
-    const form = button.closest('form');
-    return Boolean(form && deps.COMPOSER_SELECTORS.some(selector => form.querySelector(selector)));
+    if (button.matches('[data-testid="stop-button"], [data-testid="stop-generating-button"]')) return false;
+    const container = button.closest('form') || findComposerForm();
+    return Boolean(container && deps.COMPOSER_SELECTORS.some(selector => container.querySelector?.(selector)));
   }
 
   return {
