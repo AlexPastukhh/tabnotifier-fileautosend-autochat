@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.2.0
+// @version      5.2.1
 // @description  Статусы вкладки + автоотправка после загрузки вложений + системное уведомление
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -860,7 +860,6 @@
           startTop: rect.top,
           moved: false
         };
-        row.setPointerCapture?.(event.pointerId);
       });
 
       row.addEventListener('pointermove', event => {
@@ -870,6 +869,10 @@
         if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
         dragState.moved = true;
         row.dataset.dragging = 'true';
+        // Capture only after this has become a real drag. Capturing on
+        // pointerdown retargets pointerup/click to the row in Chromium, so
+        // normal button clicks never reach the button click handlers.
+        row.setPointerCapture?.(event.pointerId);
         event.preventDefault();
         setHostPosition(host, { left: dragState.startLeft + dx, top: dragState.startTop + dy });
       });
