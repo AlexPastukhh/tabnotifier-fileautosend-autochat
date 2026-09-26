@@ -30,6 +30,8 @@
 
   const COMPOSER_SELECTORS = Object.freeze([
     '#prompt-textarea[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"][aria-label*="Chat with ChatGPT" i]',
+    '[contenteditable="true"][role="textbox"][aria-label*="Message ChatGPT" i]',
     '[data-testid="composer-textarea"][contenteditable="true"]',
     'textarea[data-testid="composer-textarea"]',
     '#prompt-textarea',

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.0.0
+// @version      5.1.0
 // @description  Статусы вкладки + автоотправка после загрузки вложений + системное уведомление
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -46,6 +46,8 @@
 
   const COMPOSER_SELECTORS = Object.freeze([
     '#prompt-textarea[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"][aria-label*="Chat with ChatGPT" i]',
+    '[contenteditable="true"][role="textbox"][aria-label*="Message ChatGPT" i]',
     '[data-testid="composer-textarea"][contenteditable="true"]',
     'textarea[data-testid="composer-textarea"]',
     '#prompt-textarea',
@@ -189,13 +191,19 @@
   }
 
   function findComposer(doc = document) {
+    // ChatGPT often keeps hidden fallback textareas in the DOM. Prefer the
+    // largest visible candidate so a stale/hidden textarea cannot win.
+    const candidates = [];
     for (const selector of deps.COMPOSER_SELECTORS) {
-      const element = doc.querySelector(selector);
-      if (!element) continue;
-      const rect = element.getBoundingClientRect?.();
-      if (rect && rect.width > 20 && rect.height > 10) return element;
+      for (const element of doc.querySelectorAll(selector)) {
+        if (!isVisible(element)) continue;
+        const rect = element.getBoundingClientRect?.();
+        if (!rect || rect.width <= 20 || rect.height <= 10) continue;
+        candidates.push({ element, area: rect.width * rect.height });
+      }
     }
-    return null;
+    candidates.sort((a, b) => b.area - a.area);
+    return candidates[0]?.element || null;
   }
 
   function findSendButton(root = document) {
@@ -221,15 +229,25 @@
     const composer = findComposer(doc);
     const composerForm = composer?.closest?.('form');
     if (composerForm) return composerForm;
+
+    // Some current ChatGPT layouts wrap the editor in a composer container
+    // that is not the editor's direct form ancestor. Walk upward and accept
+    // a container that also owns the send/attach controls.
+    let node = composer?.parentElement;
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      if (node.querySelector?.('[data-testid="composer-plus-btn"], #composer-submit-button, [data-testid="send-button"], input#upload-files')) {
+        return node;
+      }
+    }
     return findSendButton(doc)?.closest?.('form') || null;
   }
 
   function findComposerBox(composer) {
     if (!composer) return null;
-    const form = composer.closest?.('form');
+    const form = composer.closest?.('form') || findComposerForm();
     if (form) {
       const rect = form.getBoundingClientRect?.();
-      if (rect && rect.width >= 180 && rect.height >= 35 && rect.height <= 320) return rect;
+      if (rect && rect.width >= 180 && rect.height >= 35 && rect.height <= 420) return rect;
     }
 
     const sendSelector = [
@@ -258,6 +276,7 @@
       'button[data-testid="composer-plus-btn"]',
       'button[data-testid*="composer-plus" i]',
       'button[aria-label*="Add photos" i]',
+      'button[aria-label="Add files and more" i]',
       'button[aria-label*="Add files" i]',
       'button[aria-label*="Attach" i]',
       'button[aria-label*="Добавить фото" i]',
@@ -267,6 +286,22 @@
     for (const selector of selectors) {
       const button = form.querySelector(selector);
       if (button && isVisible(button)) return button;
+    }
+    return null;
+  }
+
+
+  function findUploadFileInput(composer) {
+    const root = composer?.closest?.('form') || findComposerForm() || document;
+    const selectors = [
+      'input#upload-files[type="file"]',
+      'input#upload-photos[type="file"]',
+      'input[type="file"][multiple]',
+      'input[type="file"]'
+    ];
+    for (const selector of selectors) {
+      const input = root.querySelector?.(selector) || document.querySelector(selector);
+      if (input) return input;
     }
     return null;
   }
@@ -357,6 +392,7 @@
     findComposerForm,
     findComposerBox,
     findComposerPlusButton,
+    findUploadFileInput,
     chooseUploadPosition,
     getInputFileNames,
     composerHasAttachmentEvidence,
@@ -697,12 +733,18 @@
 
     function ensureUi() {
       let host = document.getElementById(deps.UPLOAD_HOST_ID);
-      if (host?.shadowRoot) return { host, button: host.shadowRoot.querySelector('button') };
+      if (host?.shadowRoot) {
+        return {
+          host,
+          autoButton: host.shadowRoot.querySelector('[data-role="auto-send"]'),
+          plusButton: host.shadowRoot.querySelector('[data-role="fallback-plus"]')
+        };
+      }
       host?.remove();
       host = document.createElement('div');
       host.id = deps.UPLOAD_HOST_ID;
       Object.assign(host.style, {
-        position: 'fixed', left: '0px', top: '0px', width: '34px', height: '34px',
+        position: 'fixed', left: '0px', top: '0px', width: '76px', height: '36px',
         zIndex: '2147483646', pointerEvents: 'none'
       });
       document.documentElement.appendChild(host);
@@ -711,6 +753,7 @@
       shadow.innerHTML = `
         <style>
           :host { all: initial; }
+          .row { display:flex; gap:6px; align-items:center; pointer-events:none; }
           button {
             width: 34px; height: 34px; padding: 0; border-radius: 999px;
             border: 1px solid rgba(128,128,128,.24); background: rgba(32,32,32,.88);
@@ -724,15 +767,32 @@
             box-shadow: 0 0 0 2px rgba(37,99,235,.18),0 2px 10px rgba(0,0,0,.24);
           }
           button[data-active="false"] { opacity: .72; }
+          [data-role="fallback-plus"] { font-size:24px; font-weight:300; }
         </style>
-        <button type="button" aria-label="Автоотправить после загрузки файлов">⇧</button>`;
-      const button = shadow.querySelector('button');
-      button.addEventListener('click', event => {
+        <div class="row">
+          <button type="button" data-role="fallback-plus" aria-label="Добавить файлы">+</button>
+          <button type="button" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
+        </div>`;
+
+      const autoButton = shadow.querySelector('[data-role="auto-send"]');
+      const plusButton = shadow.querySelector('[data-role="fallback-plus"]');
+      autoButton.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
         uploadController.toggle();
       });
-      return { host, button };
+      plusButton.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const composer = deps.findComposer();
+        const nativePlus = deps.findComposerPlusButton(composer);
+        if (nativePlus) {
+          nativePlus.click();
+          return;
+        }
+        deps.findUploadFileInput(composer)?.click();
+      });
+      return { host, autoButton, plusButton };
     }
 
     function render() {
@@ -744,15 +804,37 @@
 
       const ui = ensureUi();
       host = ui.host;
-      const position = deps.chooseUploadPosition(box, composer);
+      const nativePlus = deps.findComposerPlusButton(composer);
+      const active = tabState.isUploadMarked();
+
+      // If ChatGPT still exposes its own +, keep only ⇧ beside it. If the
+      // redesign hides/removes +, show our own + as a proxy for upload-files.
+      ui.plusButton.style.display = nativePlus ? 'none' : 'inline-flex';
+      host.style.width = nativePlus ? '34px' : '76px';
+
+      let left;
+      let top;
+      if (nativePlus) {
+        const r = nativePlus.getBoundingClientRect();
+        left = r.left - 34 - 7;
+        top = r.top + (r.height - 34) / 2;
+      } else {
+        left = box.left + 10;
+        top = box.bottom - 44;
+      }
+
+      left = Math.min(Math.max(6, left), Math.max(6, innerWidth - (nativePlus ? 34 : 76) - 6));
+      top = Math.min(Math.max(6, top), Math.max(6, innerHeight - 36 - 6));
       host.style.display = 'block';
-      host.style.left = `${Math.round(position.left)}px`;
-      host.style.top = `${Math.round(position.top)}px`;
-      ui.button.dataset.active = String(tabState.isUploadMarked());
-      ui.button.setAttribute('aria-pressed', String(tabState.isUploadMarked()));
-      ui.button.title = tabState.isUploadMarked()
+      host.style.left = `${Math.round(left)}px`;
+      host.style.top = `${Math.round(top)}px`;
+
+      ui.autoButton.dataset.active = String(active);
+      ui.autoButton.setAttribute('aria-pressed', String(active));
+      ui.autoButton.title = active
         ? 'Жду окончания загрузки файлов и затем автоматически отправлю. Нажать ещё раз — отменить.'
         : 'Когда файлы загружаются: нажать, чтобы после завершения автоматически отправить сообщение';
+      ui.plusButton.title = 'Добавить файлы';
     }
 
     function schedule() {
