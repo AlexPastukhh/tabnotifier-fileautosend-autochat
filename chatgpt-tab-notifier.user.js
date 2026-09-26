@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.4.1
+// @version      5.4.2
 // @description  Статусы вкладки + автоотправка файлов + очередь сообщений + перетаскиваемые кнопки
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -21,7 +21,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.4.1';
+  const SCRIPT_VERSION = '5.4.2';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -617,6 +617,10 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
   'use strict';
 
+  const SEND_CONFIRM_TIMEOUT_MS = 12000;
+  const SEND_RETRY_DELAY_MS = 1800;
+  const SEND_MAX_CLICKS = 3;
+
   function evaluateUploadReadiness({
     attachment,
     activityFallback = false,
@@ -635,7 +639,65 @@
     return { ready: true, reason: 'ready' };
   }
 
-  function createUploadAutoSendController({ tabState, onAutoSend = () => {} } = {}) {
+  function evaluateUploadSendConfirmation({
+    generationActive = false,
+    composerHadText = false,
+    composerHasText = false,
+    attachmentBefore = false,
+    attachmentNow = false,
+    fileInputBefore = false,
+    fileInputNow = false,
+    sendReadyNow = true,
+    currentStrongFileEvidence = false,
+    elapsedSinceClickMs = 0
+  }) {
+    if (generationActive) return { confirmed: true, reason: 'generation-started' };
+
+    // After an accepted send ChatGPT normally consumes the composer/attachment and
+    // temporarily removes or disables Send. Requiring both sides of that transition
+    // avoids treating a user edit by itself as confirmation.
+    if (!sendReadyNow) {
+      if (composerHadText && !composerHasText) return { confirmed: true, reason: 'composer-consumed' };
+      if (attachmentBefore && !attachmentNow) return { confirmed: true, reason: 'attachment-consumed' };
+      if (fileInputBefore && !fileInputNow) return { confirmed: true, reason: 'file-input-consumed' };
+      if (!currentStrongFileEvidence && elapsedSinceClickMs >= 180) {
+        return { confirmed: true, reason: 'send-became-unavailable' };
+      }
+    }
+
+    return { confirmed: false, reason: 'waiting' };
+  }
+
+  function shouldRetryUploadSend({
+    elapsedSinceClickMs = 0,
+    clickCount = 0,
+    sendReadyNow = false,
+    busy = false,
+    currentStrongFileEvidence = false,
+    sameReadyButton = false,
+    composerUnchanged = false
+  }) {
+    if (clickCount >= SEND_MAX_CLICKS) return false;
+    if (!sendReadyNow || busy) return false;
+    if (elapsedSinceClickMs < SEND_RETRY_DELAY_MS) return false;
+    if (currentStrongFileEvidence) return true;
+
+    // If the attachment DOM itself is unavailable, retry only when the exact same
+    // ready Send button and composer contents are still untouched for longer. That
+    // is a stronger signal that the previous click was ignored, while avoiding a
+    // blind duplicate click after React has already transitioned the composer.
+    return Boolean(
+      sameReadyButton &&
+      composerUnchanged &&
+      elapsedSinceClickMs >= SEND_RETRY_DELAY_MS + 700
+    );
+  }
+
+  function createUploadAutoSendController({
+    tabState,
+    onAutoSend = () => {},
+    isGenerationActive = () => false
+  } = {}) {
     let armed = false;
     let armedAt = 0;
     let readySince = 0;
@@ -645,8 +707,14 @@
     let lastFileActivityAt = 0;
     let lastFileNames = [];
     let lastFallbackLogAt = 0;
+    let sendAttempt = null;
 
-    function reset({ clearMark = true, render = true } = {}) {
+    function resetFileHistory() {
+      lastFileActivityAt = 0;
+      lastFileNames = [];
+    }
+
+    function reset({ clearMark = true, render = true, clearFileHistory = false } = {}) {
       armed = false;
       armedAt = 0;
       readySince = 0;
@@ -654,6 +722,8 @@
       sawAttachment = false;
       sawFileActivity = false;
       lastFallbackLogAt = 0;
+      sendAttempt = null;
+      if (clearFileHistory) resetFileHistory();
       if (clearMark) tabState.setUploadMarked(false, { renderNow: render });
       else if (render) tabState.render();
     }
@@ -665,12 +735,32 @@
       return true;
     }
 
+    function currentInputFileNames() {
+      return typeof deps.getInputFileNames === 'function' ? deps.getInputFileNames(document) : [];
+    }
+
+    function currentInputHasKnownFiles() {
+      const current = currentInputFileNames();
+      if (!current.length) return false;
+      if (!lastFileNames.length) return true;
+      const known = new Set(lastFileNames);
+      return current.some(name => known.has(name));
+    }
+
     function currentSendButton(form) {
       return (form && deps.findSendButton(form)) || deps.findSendButton(document);
     }
 
+    function readComposerText() {
+      const composer = typeof deps.findComposer === 'function' ? deps.findComposer() : null;
+      if (!composer) return '';
+      if (typeof HTMLTextAreaElement !== 'undefined' && composer instanceof HTMLTextAreaElement) return composer.value || '';
+      if (typeof HTMLInputElement !== 'undefined' && composer instanceof HTMLInputElement) return composer.value || '';
+      return String(composer.innerText || composer.textContent || '').replace(/\u00a0/g, ' ');
+    }
+
     function syncCurrentFileInputEvidence(now = Date.now()) {
-      const names = typeof deps.getInputFileNames === 'function' ? deps.getInputFileNames(document) : [];
+      const names = currentInputFileNames();
       if (!mergeFileNames(names)) return false;
 
       // A live file input with files is strong evidence for the current composer.
@@ -698,6 +788,7 @@
 
       const now = Date.now();
       armed = true;
+      sendAttempt = null;
       tabState.setUploadMarked(true, { renderNow: false });
       armedAt = now;
       readySince = 0;
@@ -722,7 +813,7 @@
 
     function toggle() {
       if (tabState.isUploadMarked() || armed) {
-        reset({ clearMark: true, render: true });
+        reset({ clearMark: true, render: true, clearFileHistory: true });
         console.info('[ChatGPT notifier] Автоотправка после загрузки файлов отменена.');
         return;
       }
@@ -740,8 +831,48 @@
       console.debug('[ChatGPT notifier] Обнаружен выбор/перетаскивание файла:', names);
     }
 
-    function autoSend() {
-      if (!armed) return false;
+    function finishConfirmedSend(reason) {
+      console.info(`[ChatGPT notifier] Автоотправка подтверждена (${reason}).`);
+      reset({ clearMark: true, render: true, clearFileHistory: true });
+      try { onAutoSend(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка post-send callback:', error); }
+      return true;
+    }
+
+    function failSendAttempt(message) {
+      console.warn(`[ChatGPT notifier] ${message}`);
+      reset({ clearMark: true, render: true, clearFileHistory: true });
+      return false;
+    }
+
+    function clickCurrentSend({ isRetry = false } = {}) {
+      if (!armed || !sendAttempt) return false;
+      const now = Date.now();
+      const form = deps.findComposerForm();
+      if (!form) return false;
+
+      const sendButton = currentSendButton(form);
+      if (!deps.isSendButtonReady(sendButton) || sendButton?.isConnected === false) return false;
+      if (deps.composerHasUploadBusyEvidence(form, lastFileNames)) return false;
+
+      sendAttempt.lastClickAt = now;
+      sendAttempt.clickCount += 1;
+      sendAttempt.lastButton = sendButton;
+      sendAttempt.composerTextAtLastClick = readComposerText().trim();
+      console.info(
+        `[ChatGPT notifier] Нажимаю штатный Send для файла${isRetry ? ` повторно (${sendAttempt.clickCount}/${SEND_MAX_CLICKS})` : ''}.`
+      );
+
+      try {
+        sendButton.click();
+      } catch (error) {
+        console.warn('[ChatGPT notifier] Ошибка штатного Send click:', error);
+        return false;
+      }
+      return true;
+    }
+
+    function beginSendAttempt() {
+      if (!armed || sendAttempt) return false;
 
       const now = Date.now();
       syncCurrentFileInputEvidence(now);
@@ -760,11 +891,79 @@
         console.info('[ChatGPT notifier] Карточка вложения не распознана; использую подтверждённую активность файла.');
       }
 
-      reset({ clearMark: true, render: true });
-      console.info('[ChatGPT notifier] Файлы готовы — автоматически нажимаю Send.');
-      sendButton.click();
-      onAutoSend();
+      const composerText = readComposerText().trim();
+      sendAttempt = {
+        startedAt: now,
+        lastClickAt: 0,
+        clickCount: 0,
+        lastButton: null,
+        composerTextAtLastClick: composerText,
+        composerHadText: Boolean(composerText),
+        attachmentBefore: attachment,
+        fileInputBefore: currentInputHasKnownFiles()
+      };
+
+      // IMPORTANT: do not reset/disarm before click. The controller remains armed
+      // until ChatGPT consumption/generation confirms that the send was accepted.
+      if (!clickCurrentSend()) {
+        sendAttempt = null;
+        readySince = 0;
+        return false;
+      }
       return true;
+    }
+
+    function checkSendAttempt(now = Date.now()) {
+      if (!armed || !sendAttempt) return false;
+
+      const form = deps.findComposerForm();
+      const sendButton = currentSendButton(form);
+      const sendReadyNow = deps.isSendButtonReady(sendButton);
+      const attachmentNow = Boolean(form && deps.composerHasAttachmentEvidence(form, lastFileNames));
+      const fileInputNow = currentInputHasKnownFiles();
+      const composerTextNow = readComposerText().trim();
+      const composerHasText = Boolean(composerTextNow);
+      let generationActive = false;
+      try { generationActive = Boolean(isGenerationActive()); } catch (_) {}
+      const currentStrongFileEvidence = attachmentNow || fileInputNow;
+      const elapsedSinceClickMs = Math.max(0, now - (sendAttempt.lastClickAt || sendAttempt.startedAt));
+
+      const confirmation = evaluateUploadSendConfirmation({
+        generationActive,
+        composerHadText: sendAttempt.composerHadText,
+        composerHasText,
+        attachmentBefore: sendAttempt.attachmentBefore,
+        attachmentNow,
+        fileInputBefore: sendAttempt.fileInputBefore,
+        fileInputNow,
+        sendReadyNow,
+        currentStrongFileEvidence,
+        elapsedSinceClickMs
+      });
+      if (confirmation.confirmed) return finishConfirmedSend(confirmation.reason);
+
+      if (now - sendAttempt.startedAt >= SEND_CONFIRM_TIMEOUT_MS) {
+        return failSendAttempt('Send не удалось подтвердить за отведённое время; автоотправка выключена без дополнительных кликов.');
+      }
+
+      if (!form) return false;
+      const busy = deps.composerHasUploadBusyEvidence(form, lastFileNames);
+      const retry = shouldRetryUploadSend({
+        elapsedSinceClickMs,
+        clickCount: sendAttempt.clickCount,
+        sendReadyNow,
+        busy,
+        currentStrongFileEvidence,
+        sameReadyButton: Boolean(sendButton && sendButton === sendAttempt.lastButton && sendButton.isConnected !== false),
+        composerUnchanged: composerTextNow === sendAttempt.composerTextAtLastClick
+      });
+      if (!retry) return false;
+
+      return clickCurrentSend({ isRetry: true });
+    }
+
+    function autoSend() {
+      return beginSendAttempt();
     }
 
     function check() {
@@ -773,7 +972,12 @@
       const now = Date.now();
       if (now - armedAt > deps.SETTINGS.uploadAutoSendTimeoutMs) {
         console.warn('[ChatGPT notifier] Автоотправка отменена по таймауту ожидания загрузки.');
-        reset({ clearMark: true, render: true });
+        reset({ clearMark: true, render: true, clearFileHistory: true });
+        return;
+      }
+
+      if (sendAttempt) {
+        checkSendAttempt(now);
         return;
       }
 
@@ -795,9 +999,6 @@
       if (attachment) sawAttachment = true;
       if (now - lastFileActivityAt <= deps.SETTINGS.recentFileActivityWindowMs) sawFileActivity = true;
 
-      // ChatGPT changes attachment-card markup frequently. A real file input/drop/paste
-      // event is therefore accepted as a short-lived fallback, but only while Send is
-      // stable and there is no upload-busy evidence.
       if ((!attachment && !activityFallback) || busy || !sendReady) {
         readySince = 0;
         return;
@@ -823,12 +1024,7 @@
         armAgeMs: now - armedAt,
         readyAgeMs: now - readySince
       });
-      if (evaluation.ready) autoSend();
-    }
-
-    function resetFileHistory() {
-      lastFileActivityAt = 0;
-      lastFileNames = [];
+      if (evaluation.ready) beginSendAttempt();
     }
 
     return {
@@ -840,11 +1036,17 @@
       autoSend,
       resetFileHistory,
       isArmed: () => armed,
+      isConfirmingSend: () => Boolean(sendAttempt),
       getKnownFileNames: () => [...lastFileNames]
     };
   }
 
-  return { evaluateUploadReadiness, createUploadAutoSendController };
+  return {
+    evaluateUploadReadiness,
+    evaluateUploadSendConfirmation,
+    shouldRetryUploadSend,
+    createUploadAutoSendController
+  };
 });
 
 (function (root, factory) {
@@ -2034,14 +2236,18 @@
       tabState,
       notifications,
       beforeArm: () => {
+        // A synthetic click from file auto-send reaches the same document click
+        // listener as a manual Send. While that transaction is waiting for
+        // confirmation it must stay armed; other sends still cancel file auto-send.
+        if (uploadController?.isConfirmingSend()) return;
         if (tabState.isUploadMarked() || uploadController?.isArmed()) {
-          uploadController?.reset({ clearMark: true, render: false });
+          uploadController?.reset({ clearMark: true, render: false, clearFileHistory: true });
         }
       },
       onFinished: () => queuedPromptController?.handleResponseFinished()
     });
 
-    uploadController = deps.createUploadAutoSendController({ tabState });
+    uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
     queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
     uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController });
     let lastUrl = location.href;
