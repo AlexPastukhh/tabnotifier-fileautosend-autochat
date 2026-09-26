@@ -33,23 +33,37 @@
     uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController });
     let lastUrl = location.href;
 
-    document.addEventListener('change', event => {
+    function recheckUploadSoon() {
+      if (!uploadController?.isArmed()) return;
+      uploadController.check();
+      window.setTimeout(() => {
+        if (uploadController?.isArmed()) uploadController.check();
+      }, 250);
+      window.setTimeout(() => {
+        if (uploadController?.isArmed()) uploadController.check();
+      }, 1200);
+    }
+
+    function handleFileInputEvent(event) {
       const input = event.target;
       if (typeof HTMLInputElement === 'undefined' || !(input instanceof HTMLInputElement) || input.type !== 'file') return;
       uploadController.rememberFileActivity(input.files);
-      if (uploadController.isArmed()) uploadController.check();
-    }, true);
+      recheckUploadSoon();
+    }
+
+    document.addEventListener('input', handleFileInputEvent, true);
+    document.addEventListener('change', handleFileInputEvent, true);
 
     document.addEventListener('drop', event => {
       if (!event.dataTransfer?.files?.length) return;
       uploadController.rememberFileActivity(event.dataTransfer.files);
-      if (uploadController.isArmed()) uploadController.check();
+      recheckUploadSoon();
     }, true);
 
     document.addEventListener('paste', event => {
       if (!event.clipboardData?.files?.length) return;
       uploadController.rememberFileActivity(event.clipboardData.files);
-      if (uploadController.isArmed()) uploadController.check();
+      recheckUploadSoon();
     }, true);
 
     document.addEventListener('click', event => {
@@ -73,13 +87,17 @@
       responseMonitor.check();
     }
 
+    function handleForeground() {
+      markViewed();
+      recheckUploadSoon();
+      scheduleUi();
+    }
+
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) {
-        markViewed();
-        scheduleUi();
-      }
+      if (!document.hidden) handleForeground();
     });
-    window.addEventListener('focus', markViewed);
+    window.addEventListener('focus', handleForeground);
+    window.addEventListener('pageshow', handleForeground);
     window.addEventListener('resize', scheduleUi, { passive: true });
     window.addEventListener('scroll', scheduleUi, { passive: true, capture: true });
 
