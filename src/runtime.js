@@ -21,14 +21,18 @@
       tabState,
       notifications,
       beforeArm: () => {
+        // A synthetic click from file auto-send reaches the same document click
+        // listener as a manual Send. While that transaction is waiting for
+        // confirmation it must stay armed; other sends still cancel file auto-send.
+        if (uploadController?.isConfirmingSend()) return;
         if (tabState.isUploadMarked() || uploadController?.isArmed()) {
-          uploadController?.reset({ clearMark: true, render: false });
+          uploadController?.reset({ clearMark: true, render: false, clearFileHistory: true });
         }
       },
       onFinished: () => queuedPromptController?.handleResponseFinished()
     });
 
-    uploadController = deps.createUploadAutoSendController({ tabState });
+    uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
     queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
     uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController });
     let lastUrl = location.href;
