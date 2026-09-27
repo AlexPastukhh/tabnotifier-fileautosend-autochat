@@ -94,26 +94,52 @@ test('send confirmation accepts consumed file input with unavailable Send', () =
   );
 });
 
-test('fallback-only send may confirm after Send becomes unavailable and no strong file evidence remains', () => {
+test('transient missing composer context is never treated as send confirmation', () => {
   assert.deepEqual(
     evaluateUploadSendConfirmation({
+      contextAvailable: false,
       sendReadyNow: false,
       currentStrongFileEvidence: false,
-      elapsedSinceClickMs: 200
+      elapsedSinceClickMs: 500
     }),
-    { confirmed: true, reason: 'send-became-unavailable' }
+    { confirmed: false, reason: 'composer-context-missing' }
+  );
+});
+
+test('consumption from a replaced composer is not enough to confirm send', () => {
+  assert.deepEqual(
+    evaluateUploadSendConfirmation({
+      contextAvailable: true,
+      sameComposerContext: false,
+      attachmentBefore: true,
+      attachmentNow: false,
+      sendReadyNow: false
+    }),
+    { confirmed: false, reason: 'waiting' }
   );
 });
 
 
-test('retry is allowed when strong current file evidence still proves the payload is waiting', () => {
+test('retry is allowed when strong current file evidence still proves the unchanged payload is waiting', () => {
   assert.equal(shouldRetryUploadSend({
     elapsedSinceClickMs: 1900,
     clickCount: 1,
     sendReadyNow: true,
     busy: false,
-    currentStrongFileEvidence: true
+    currentStrongFileEvidence: true,
+    composerUnchanged: true
   }), true);
+});
+
+test('strong file evidence does not allow retry after composer text changed', () => {
+  assert.equal(shouldRetryUploadSend({
+    elapsedSinceClickMs: 3000,
+    clickCount: 1,
+    sendReadyNow: true,
+    busy: false,
+    currentStrongFileEvidence: true,
+    composerUnchanged: false
+  }), false);
 });
 
 test('fallback-only retry requires the exact same ready button and unchanged composer for longer', () => {
@@ -124,6 +150,7 @@ test('fallback-only retry requires the exact same ready button and unchanged com
     busy: false,
     currentStrongFileEvidence: false,
     sameReadyButton: true,
+    sameComposerContext: true,
     composerUnchanged: true
   }), true);
 });
@@ -136,6 +163,20 @@ test('fallback-only retry is blocked after a composer/button transition', () => 
     busy: false,
     currentStrongFileEvidence: false,
     sameReadyButton: false,
+    sameComposerContext: false,
+    composerUnchanged: true
+  }), false);
+});
+
+test('fallback-only retry is blocked when React replaced composer even if Send node survived', () => {
+  assert.equal(shouldRetryUploadSend({
+    elapsedSinceClickMs: 3000,
+    clickCount: 1,
+    sendReadyNow: true,
+    busy: false,
+    currentStrongFileEvidence: false,
+    sameReadyButton: true,
+    sameComposerContext: false,
     composerUnchanged: true
   }), false);
 });

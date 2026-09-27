@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.4.3
+// @version      5.4.4
 // @description  Статусы вкладки + автоотправка файлов + очередь сообщений + перетаскиваемые кнопки
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -21,7 +21,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.4.3';
+  const SCRIPT_VERSION = '5.4.4';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -735,6 +735,8 @@
 
   function evaluateUploadSendConfirmation({
     generationActive = false,
+    contextAvailable = true,
+    sameComposerContext = true,
     composerHadText = false,
     composerHasText = false,
     attachmentBefore = false,
@@ -746,17 +748,17 @@
     elapsedSinceClickMs = 0
   }) {
     if (generationActive) return { confirmed: true, reason: 'generation-started' };
+    if (!contextAvailable) return { confirmed: false, reason: 'composer-context-missing' };
 
-    // After an accepted send ChatGPT normally consumes the composer/attachment and
-    // temporarily removes or disables Send. Requiring both sides of that transition
-    // avoids treating a user edit by itself as confirmation.
-    if (!sendReadyNow) {
+    // A transient React re-render can temporarily remove the current composer and
+    // Send button. Never interpret that gap as a successful send. Consumption-based
+    // confirmation is accepted only while we are still observing the same composer
+    // instance that received the click; a replaced composer must be confirmed by
+    // generation state instead.
+    if (!sendReadyNow && sameComposerContext) {
       if (composerHadText && !composerHasText) return { confirmed: true, reason: 'composer-consumed' };
       if (attachmentBefore && !attachmentNow) return { confirmed: true, reason: 'attachment-consumed' };
       if (fileInputBefore && !fileInputNow) return { confirmed: true, reason: 'file-input-consumed' };
-      if (!currentStrongFileEvidence && elapsedSinceClickMs >= 180) {
-        return { confirmed: true, reason: 'send-became-unavailable' };
-      }
     }
 
     return { confirmed: false, reason: 'waiting' };
@@ -769,11 +771,15 @@
     busy = false,
     currentStrongFileEvidence = false,
     sameReadyButton = false,
+    sameComposerContext = false,
     composerUnchanged = false
   }) {
     if (clickCount >= SEND_MAX_CLICKS) return false;
     if (!sendReadyNow || busy) return false;
     if (elapsedSinceClickMs < SEND_RETRY_DELAY_MS) return false;
+    // Never retry after the user (or ChatGPT) changed the composer contents. A
+    // retry must only resend the exact still-pending composer state we observed.
+    if (!composerUnchanged) return false;
     if (currentStrongFileEvidence) return true;
 
     // If the attachment DOM itself is unavailable, retry only when the exact same
@@ -782,6 +788,7 @@
     // blind duplicate click after React has already transitioned the composer.
     return Boolean(
       sameReadyButton &&
+      sameComposerContext &&
       composerUnchanged &&
       elapsedSinceClickMs >= SEND_RETRY_DELAY_MS + 700
     );
@@ -829,32 +836,75 @@
       return true;
     }
 
-    function currentInputFileNames() {
-      return typeof deps.getInputFileNames === 'function' ? deps.getInputFileNames(document) : [];
+    function currentInputFileNames(root = document) {
+      return typeof deps.getInputFileNames === 'function' ? deps.getInputFileNames(root || document) : [];
     }
 
-    function currentInputHasKnownFiles() {
-      const current = currentInputFileNames();
+    function currentInputHasKnownFiles(root = document) {
+      const current = currentInputFileNames(root);
       if (!current.length) return false;
       if (!lastFileNames.length) return true;
       const known = new Set(lastFileNames);
       return current.some(name => known.has(name));
     }
 
-    function currentSendButton(form) {
-      return (form && deps.findSendButton(form)) || deps.findSendButton(document);
-    }
-
-    function readComposerText() {
-      const composer = typeof deps.findComposer === 'function' ? deps.findComposer() : null;
+    function readComposerTextFrom(composer) {
       if (!composer) return '';
       if (typeof HTMLTextAreaElement !== 'undefined' && composer instanceof HTMLTextAreaElement) return composer.value || '';
       if (typeof HTMLInputElement !== 'undefined' && composer instanceof HTMLInputElement) return composer.value || '';
       return String(composer.innerText || composer.textContent || '').replace(/\u00a0/g, ' ');
     }
 
-    function syncCurrentFileInputEvidence(now = Date.now()) {
-      const names = currentInputFileNames();
+    function currentComposerContext() {
+      if (typeof deps.findComposerContext !== 'function') return null;
+      const context = deps.findComposerContext(document);
+      const composer = context?.composer || null;
+      const container = context?.container || context?.form || null;
+      if (!composer || composer.isConnected === false || !container || container.isConnected === false) return null;
+
+      let sendButton = context?.sendButton || null;
+      if (!sendButton || sendButton.isConnected === false || !container.contains?.(sendButton)) {
+        sendButton = typeof deps.findSendButton === 'function' ? deps.findSendButton(container) : null;
+      }
+      return { composer, container, form: container, sendButton };
+    }
+
+    function readUploadSnapshot(now = Date.now(), { syncFileInput = false } = {}) {
+      const context = currentComposerContext();
+      if (context && syncFileInput) syncCurrentFileInputEvidence(now, context.container);
+
+      if (!context) {
+        return {
+          contextAvailable: false,
+          context: null,
+          composer: null,
+          form: null,
+          sendButton: null,
+          sendReady: false,
+          busy: false,
+          attachment: false,
+          fileInputHasKnownFiles: false,
+          composerText: ''
+        };
+      }
+
+      const { composer, container, sendButton } = context;
+      return {
+        contextAvailable: true,
+        context,
+        composer,
+        form: container,
+        sendButton,
+        sendReady: deps.isSendButtonReady(sendButton),
+        busy: deps.composerHasUploadBusyEvidence(container, lastFileNames),
+        attachment: deps.composerHasAttachmentEvidence(container, lastFileNames),
+        fileInputHasKnownFiles: currentInputHasKnownFiles(container),
+        composerText: readComposerTextFrom(composer).trim()
+      };
+    }
+
+    function syncCurrentFileInputEvidence(now = Date.now(), root = document) {
+      const names = currentInputFileNames(root);
       if (!mergeFileNames(names)) return false;
 
       // A live file input with files is strong evidence for the current composer.
@@ -887,17 +937,9 @@
       armedAt = now;
       readySince = 0;
       sawFileActivity = now - lastFileActivityAt <= deps.SETTINGS.recentFileActivityWindowMs;
-      syncCurrentFileInputEvidence(now);
-
-      const form = deps.findComposerForm();
-      const sendButton = currentSendButton(form);
-      sawBusy = Boolean(
-        form && (
-          deps.composerHasUploadBusyEvidence(form, lastFileNames) ||
-          !deps.isSendButtonReady(sendButton)
-        )
-      );
-      sawAttachment = Boolean(form && deps.composerHasAttachmentEvidence(form, lastFileNames));
+      const snapshot = readUploadSnapshot(now, { syncFileInput: true });
+      sawBusy = Boolean(snapshot.contextAvailable && (snapshot.busy || !snapshot.sendReady));
+      sawAttachment = Boolean(snapshot.attachment);
 
       tabState.save();
       tabState.render();
@@ -941,23 +983,29 @@
     function clickCurrentSend({ isRetry = false } = {}) {
       if (!armed || !sendAttempt) return false;
       const now = Date.now();
-      const form = deps.findComposerForm();
-      if (!form) return false;
+      const snapshot = readUploadSnapshot(now, { syncFileInput: true });
+      if (!snapshot.contextAvailable || !snapshot.sendReady || snapshot.sendButton?.isConnected === false) return false;
+      if (snapshot.busy) return false;
 
-      const sendButton = currentSendButton(form);
-      if (!deps.isSendButtonReady(sendButton) || sendButton?.isConnected === false) return false;
-      if (deps.composerHasUploadBusyEvidence(form, lastFileNames)) return false;
+      const activityFallback = hasFreshActivityFallback(now);
+      const strongFileEvidence = snapshot.attachment || snapshot.fileInputHasKnownFiles;
+      if (!strongFileEvidence && !activityFallback) return false;
 
       sendAttempt.lastClickAt = now;
       sendAttempt.clickCount += 1;
-      sendAttempt.lastButton = sendButton;
-      sendAttempt.composerTextAtLastClick = readComposerText().trim();
+      sendAttempt.lastButton = snapshot.sendButton;
+      sendAttempt.lastComposer = snapshot.composer;
+      sendAttempt.lastContainer = snapshot.form;
+      sendAttempt.composerTextAtLastClick = snapshot.composerText;
+      sendAttempt.composerHadText = Boolean(snapshot.composerText);
+      sendAttempt.attachmentBefore = snapshot.attachment;
+      sendAttempt.fileInputBefore = snapshot.fileInputHasKnownFiles;
       console.info(
         `[ChatGPT notifier] Нажимаю штатный Send для файла${isRetry ? ` повторно (${sendAttempt.clickCount}/${SEND_MAX_CLICKS})` : ''}.`
       );
 
       try {
-        sendButton.click();
+        snapshot.sendButton.click();
       } catch (error) {
         console.warn('[ChatGPT notifier] Ошибка штатного Send click:', error);
         return false;
@@ -969,36 +1017,34 @@
       if (!armed || sendAttempt) return false;
 
       const now = Date.now();
-      syncCurrentFileInputEvidence(now);
+      const snapshot = readUploadSnapshot(now, { syncFileInput: true });
+      if (!snapshot.contextAvailable || !snapshot.sendReady) return false;
 
-      const form = deps.findComposerForm();
-      const sendButton = currentSendButton(form);
-      if (!form || !deps.isSendButtonReady(sendButton)) return false;
-
-      const attachment = deps.composerHasAttachmentEvidence(form, lastFileNames);
       const activityFallback = hasFreshActivityFallback(now);
-      if (!attachment && !activityFallback) return false;
-      if (deps.composerHasUploadBusyEvidence(form, lastFileNames)) return false;
+      if (!snapshot.attachment && !snapshot.fileInputHasKnownFiles && !activityFallback) return false;
+      if (snapshot.busy) return false;
 
-      if (!attachment && activityFallback && now - lastFallbackLogAt > 2000) {
+      if (!snapshot.attachment && !snapshot.fileInputHasKnownFiles && activityFallback && now - lastFallbackLogAt > 2000) {
         lastFallbackLogAt = now;
         console.info('[ChatGPT notifier] Карточка вложения не распознана; использую подтверждённую активность файла.');
       }
 
-      const composerText = readComposerText().trim();
       sendAttempt = {
         startedAt: now,
         lastClickAt: 0,
         clickCount: 0,
         lastButton: null,
-        composerTextAtLastClick: composerText,
-        composerHadText: Boolean(composerText),
-        attachmentBefore: attachment,
-        fileInputBefore: currentInputHasKnownFiles()
+        lastComposer: null,
+        lastContainer: null,
+        composerTextAtLastClick: snapshot.composerText,
+        composerHadText: Boolean(snapshot.composerText),
+        attachmentBefore: snapshot.attachment,
+        fileInputBefore: snapshot.fileInputHasKnownFiles
       };
 
-      // IMPORTANT: do not reset/disarm before click. The controller remains armed
-      // until ChatGPT consumption/generation confirms that the send was accepted.
+      // IMPORTANT: keep the transaction armed through React re-renders. The actual
+      // click reacquires one coherent composer/context snapshot and stores exactly
+      // the elements that received that click for later confirmation.
       if (!clickCurrentSend()) {
         sendAttempt = null;
         readySince = 0;
@@ -1010,27 +1056,29 @@
     function checkSendAttempt(now = Date.now()) {
       if (!armed || !sendAttempt) return false;
 
-      const form = deps.findComposerForm();
-      const sendButton = currentSendButton(form);
-      const sendReadyNow = deps.isSendButtonReady(sendButton);
-      const attachmentNow = Boolean(form && deps.composerHasAttachmentEvidence(form, lastFileNames));
-      const fileInputNow = currentInputHasKnownFiles();
-      const composerTextNow = readComposerText().trim();
-      const composerHasText = Boolean(composerTextNow);
+      const snapshot = readUploadSnapshot(now, { syncFileInput: true });
       let generationActive = false;
       try { generationActive = Boolean(isGenerationActive()); } catch (_) {}
-      const currentStrongFileEvidence = attachmentNow || fileInputNow;
+
+      const currentStrongFileEvidence = snapshot.attachment || snapshot.fileInputHasKnownFiles;
       const elapsedSinceClickMs = Math.max(0, now - (sendAttempt.lastClickAt || sendAttempt.startedAt));
+      const sameComposerContext = Boolean(
+        snapshot.contextAvailable &&
+        snapshot.composer === sendAttempt.lastComposer &&
+        snapshot.form === sendAttempt.lastContainer
+      );
 
       const confirmation = evaluateUploadSendConfirmation({
         generationActive,
+        contextAvailable: snapshot.contextAvailable,
+        sameComposerContext,
         composerHadText: sendAttempt.composerHadText,
-        composerHasText,
+        composerHasText: Boolean(snapshot.composerText),
         attachmentBefore: sendAttempt.attachmentBefore,
-        attachmentNow,
+        attachmentNow: snapshot.attachment,
         fileInputBefore: sendAttempt.fileInputBefore,
-        fileInputNow,
-        sendReadyNow,
+        fileInputNow: snapshot.fileInputHasKnownFiles,
+        sendReadyNow: snapshot.sendReady,
         currentStrongFileEvidence,
         elapsedSinceClickMs
       });
@@ -1040,16 +1088,24 @@
         return failSendAttempt('Send не удалось подтвердить за отведённое время; автоотправка выключена без дополнительных кликов.');
       }
 
-      if (!form) return false;
-      const busy = deps.composerHasUploadBusyEvidence(form, lastFileNames);
+      // Missing/replaced composer context is a temporary React state, not success.
+      // Wait for a coherent replacement context, then retry only under the existing
+      // conservative file-evidence rules.
+      if (!snapshot.contextAvailable) return false;
+
       const retry = shouldRetryUploadSend({
         elapsedSinceClickMs,
         clickCount: sendAttempt.clickCount,
-        sendReadyNow,
-        busy,
+        sendReadyNow: snapshot.sendReady,
+        busy: snapshot.busy,
         currentStrongFileEvidence,
-        sameReadyButton: Boolean(sendButton && sendButton === sendAttempt.lastButton && sendButton.isConnected !== false),
-        composerUnchanged: composerTextNow === sendAttempt.composerTextAtLastClick
+        sameReadyButton: Boolean(
+          snapshot.sendButton &&
+          snapshot.sendButton === sendAttempt.lastButton &&
+          snapshot.sendButton.isConnected !== false
+        ),
+        sameComposerContext,
+        composerUnchanged: snapshot.composerText === sendAttempt.composerTextAtLastClick
       });
       if (!retry) return false;
 
@@ -1075,30 +1131,28 @@
         return;
       }
 
-      syncCurrentFileInputEvidence(now);
-
-      const form = deps.findComposerForm();
-      if (!form) {
+      const snapshot = readUploadSnapshot(now, { syncFileInput: true });
+      if (!snapshot.contextAvailable) {
         readySince = 0;
         return;
       }
 
-      const sendButton = currentSendButton(form);
-      const busy = deps.composerHasUploadBusyEvidence(form, lastFileNames);
-      const attachment = deps.composerHasAttachmentEvidence(form, lastFileNames);
+      const busy = snapshot.busy;
+      const attachment = snapshot.attachment;
       const activityFallback = hasFreshActivityFallback(now);
-      const sendReady = deps.isSendButtonReady(sendButton);
+      const sendReady = snapshot.sendReady;
+      const fileInputHasKnownFiles = snapshot.fileInputHasKnownFiles;
 
       if (busy || !sendReady) sawBusy = true;
       if (attachment) sawAttachment = true;
-      if (now - lastFileActivityAt <= deps.SETTINGS.recentFileActivityWindowMs) sawFileActivity = true;
+      if (fileInputHasKnownFiles || now - lastFileActivityAt <= deps.SETTINGS.recentFileActivityWindowMs) sawFileActivity = true;
 
-      if ((!attachment && !activityFallback) || busy || !sendReady) {
+      if ((!attachment && !fileInputHasKnownFiles && !activityFallback) || busy || !sendReady) {
         readySince = 0;
         return;
       }
 
-      const hasFileRelation = attachment || activityFallback || sawFileActivity || sawBusy || sawAttachment;
+      const hasFileRelation = attachment || fileInputHasKnownFiles || activityFallback || sawFileActivity || sawBusy || sawAttachment;
       if (!hasFileRelation) {
         readySince = 0;
         return;
