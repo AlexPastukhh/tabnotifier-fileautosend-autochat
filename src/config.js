@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.4.4';
+  const SCRIPT_VERSION = '5.5.0';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,

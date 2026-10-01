@@ -14,12 +14,13 @@ const sourceFiles = [
   'src/notifications.js',
   'src/upload-auto-send.js',
   'src/queued-prompt.js',
+  'src/delayed-send.js',
   'src/upload-button-ui.js',
   'src/response-monitor.js',
   'src/runtime.js'
 ];
 
-const header = `// ==UserScript==\n// @name         ChatGPT — значки вкладок, загрузка файлов и уведомления\n// @namespace    local.chatgpt.tab-notifier\n// @version      ${pkg.version}\n// @description  Статусы вкладки + автоотправка файлов + очередь сообщений + перетаскиваемые кнопки\n// @match        https://chatgpt.com/*\n// @match        https://chat.openai.com/*\n// @run-at       document-idle\n// @grant        GM_notification\n// @grant        GM_registerMenuCommand\n// ==/UserScript==\n\n// GENERATED FILE — DO NOT EDIT MANUALLY.\n// Source: src/**\n// Build: npm run build\n\n`;
+const header = `// ==UserScript==\n// @name         ChatGPT — значки вкладок, загрузка файлов и уведомления\n// @namespace    local.chatgpt.tab-notifier\n// @version      ${pkg.version}\n// @description  Статусы вкладки + автоотправка файлов + очередь сообщений + отложенная отправка + перетаскиваемые кнопки\n// @match        https://chatgpt.com/*\n// @match        https://chat.openai.com/*\n// @run-at       document-idle\n// @grant        GM_notification\n// @grant        GM_registerMenuCommand\n// ==/UserScript==\n\n// GENERATED FILE — DO NOT EDIT MANUALLY.\n// Source: src/**\n// Build: npm run build\n\n`;
 
 const modules = sourceFiles
   .map(relative => fs.readFileSync(path.join(root, relative), 'utf8').trimEnd())
