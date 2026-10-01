@@ -9,6 +9,7 @@
     let uploadUi = null;
     let uploadController = null;
     let queuedPromptController = null;
+    let delayedSendController = null;
 
     function scheduleUi() {
       uploadUi?.schedule();
@@ -34,7 +35,8 @@
 
     uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
     queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
-    uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController });
+    delayedSendController = deps.createDelayedSendController({ onChange: scheduleUi, isGenerationActive: deps.isGenerating });
+    uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController });
     let lastUrl = location.href;
 
     function recheckUploadSoon() {
@@ -71,19 +73,32 @@
     }, true);
 
     document.addEventListener('click', event => {
-      if (deps.isComposerSendButton(event.target)) responseMonitor.armAnswer('send-button');
+      if (!deps.isComposerSendButton(event.target)) return;
+      responseMonitor.armAnswer('send-button');
+      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
+        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
+      }
     }, true);
 
     document.addEventListener('keydown', event => {
       if (
         event.key === 'Enter' && !event.isComposing && !event.shiftKey && !event.ctrlKey &&
         !event.altKey && !event.metaKey && deps.isComposerTarget(event.target)
-      ) responseMonitor.armAnswer('enter-key');
+      ) {
+        responseMonitor.armAnswer('enter-key');
+        if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
+          delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
+        }
+      }
     }, true);
 
     document.addEventListener('submit', event => {
       if (typeof HTMLFormElement === 'undefined' || !(event.target instanceof HTMLFormElement)) return;
-      if (deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) responseMonitor.armAnswer('form-submit');
+      if (!deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) return;
+      responseMonitor.armAnswer('form-submit');
+      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
+        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
+      }
     }, true);
 
     function markViewed() {
@@ -94,6 +109,7 @@
     function handleForeground() {
       markViewed();
       recheckUploadSoon();
+      delayedSendController?.check();
       scheduleUi();
     }
 
@@ -111,6 +127,7 @@
       uploadController.reset({ clearMark: true, render: false });
       uploadController.resetFileHistory();
       queuedPromptController.resetForNavigation();
+      delayedSendController?.resetForNavigation();
       uploadUi.closeQueuePanel?.();
       tabState.resetForNavigation();
       setTimeout(responseMonitor.check, 400);
@@ -142,12 +159,14 @@
       responseMonitor.check();
       uploadController.check();
       queuedPromptController.attemptSend();
+      delayedSendController?.check();
       tickCount += 1;
       if (!document.hidden && tickCount % 6 === 0) scheduleUi();
     }, deps.SETTINGS.checkIntervalMs);
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand(`ℹ Версия: v${deps.SCRIPT_VERSION}`, () => console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION}`));
+      GM_registerMenuCommand('◷ Отложенная отправка текущего текста', delayedSendController.toggle);
       GM_registerMenuCommand('⇧ Автоотправка после загрузки файлов', uploadController.toggle);
       GM_registerMenuCommand('● Проверить уведомление', notifications.showDesktopNotification);
     }
@@ -155,7 +174,7 @@
     tabState.render();
     responseMonitor.check();
     scheduleUi();
-    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: + открывает очередь сообщений, ⇧ управляет автоотправкой файлов.`);
+    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — отложенная отправка, + — очередь, ⇧ — автоотправка файлов.`);
 
     return {
       dispose() {
@@ -165,6 +184,7 @@
       tabState,
       uploadController,
       queuedPromptController,
+      delayedSendController,
       responseMonitor,
       uploadUi
     };

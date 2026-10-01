@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.4.4
-// @description  Статусы вкладки + автоотправка файлов + очередь сообщений + перетаскиваемые кнопки
+// @version      5.5.0
+// @description  Статусы вкладки + автоотправка файлов + очередь сообщений + отложенная отправка + перетаскиваемые кнопки
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-idle
@@ -21,7 +21,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.4.4';
+  const SCRIPT_VERSION = '5.5.0';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -1815,6 +1815,353 @@
 
 (function (root, factory) {
   const deps = typeof require === 'function'
+    ? Object.assign({}, require('./config.js'), require('./chatgpt-dom.js'), require('./queued-prompt.js'), root.ChatGPTTabNotifier || {})
+    : (root.ChatGPTTabNotifier || {});
+  const api = factory(deps);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  root.ChatGPTTabNotifier = Object.assign(root.ChatGPTTabNotifier || {}, api);
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
+  'use strict';
+
+  const DEFAULT_DELAY_MS = 5 * 60 * 1000;
+  const MIN_DELAY_MS = 10 * 1000;
+  const MAX_DELAY_MS = 24 * 60 * 60 * 1000;
+  const TEXT_MISMATCH_GRACE_MS = 700;
+  const SEND_RETRY_DELAY_MS = 1600;
+  const SEND_CONFIRM_TIMEOUT_MS = 10000;
+  const SEND_MAX_CLICKS = 3;
+  const SETTINGS_KEY = 'chatgpt-tab-notifier-delayed-send-settings-v1';
+  const STATE_KEY = 'chatgpt-tab-notifier-delayed-send-state-v1';
+
+  function normalizeDelayMs(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return DEFAULT_DELAY_MS;
+    return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, Math.round(numeric)));
+  }
+
+  function formatDelayedRemaining(ms) {
+    const totalSeconds = Math.max(0, Math.ceil(Number(ms || 0) / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  function evaluateDelayedSendConfirmation({
+    generationActive = false,
+    clickedComposerConnected = false,
+    clickedComposerHasText = true
+  } = {}) {
+    if (generationActive) return { confirmed: true, reason: 'generation-started' };
+    if (clickedComposerConnected && !clickedComposerHasText) {
+      return { confirmed: true, reason: 'clicked-composer-consumed' };
+    }
+    return { confirmed: false, reason: 'waiting' };
+  }
+
+  function createDelayedSendController({
+    onChange = () => {},
+    isGenerationActive = () => false,
+    storage = (typeof localStorage !== 'undefined' ? localStorage : null),
+    now = () => Date.now(),
+    getRouteKey = () => (typeof location !== 'undefined' ? location.href : ''),
+    resolveContext = () => deps.findComposerContext?.(),
+    isSendReady = button => deps.isSendButtonReady?.(button),
+    readText = composer => deps.readComposerText?.(composer) || '',
+    normalizeText = value => deps.normalizeComposerTextForOwnership?.(value) || String(value || '').trim()
+  } = {}) {
+    let delayMs = DEFAULT_DELAY_MS;
+    let job = null;
+    let lastStatus = '';
+    let lastRenderedSecond = null;
+
+    function emitChange() {
+      try { onChange(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка обновления таймера:', error); }
+    }
+
+    function storageGet(key) {
+      try { return storage?.getItem?.(key) ?? null; } catch (_) { return null; }
+    }
+
+    function storageSet(key, value) {
+      try { storage?.setItem?.(key, value); } catch (_) {}
+    }
+
+    function storageRemove(key) {
+      try { storage?.removeItem?.(key); } catch (_) {}
+    }
+
+    function persistSettings() {
+      storageSet(SETTINGS_KEY, JSON.stringify({ delayMs }));
+    }
+
+    function persistWaitingJob() {
+      if (!job || job.phase !== 'waiting') {
+        storageRemove(STATE_KEY);
+        return;
+      }
+      storageSet(STATE_KEY, JSON.stringify({
+        deadline: job.deadline,
+        expectedNormalized: job.expectedNormalized,
+        routeKey: job.routeKey
+      }));
+    }
+
+    function clearPersistedJob() {
+      storageRemove(STATE_KEY);
+    }
+
+    function setStatus(message) {
+      lastStatus = String(message || '');
+      emitChange();
+    }
+
+    function clearJob({ status = '', persist = true } = {}) {
+      job = null;
+      lastRenderedSecond = null;
+      if (persist) clearPersistedJob();
+      lastStatus = String(status || '');
+      emitChange();
+    }
+
+    function loadPersistedState() {
+      try {
+        const settings = JSON.parse(storageGet(SETTINGS_KEY) || 'null');
+        if (settings?.delayMs) delayMs = normalizeDelayMs(settings.delayMs);
+      } catch (_) {}
+
+      try {
+        const saved = JSON.parse(storageGet(STATE_KEY) || 'null');
+        if (!saved) return;
+        const deadline = Number(saved.deadline);
+        const expectedNormalized = normalizeText(saved.expectedNormalized);
+        const routeKey = String(saved.routeKey || '');
+        if (!Number.isFinite(deadline) || !expectedNormalized || routeKey !== String(getRouteKey() || '')) {
+          clearPersistedJob();
+          return;
+        }
+        job = {
+          phase: 'waiting',
+          deadline,
+          expectedNormalized,
+          routeKey,
+          mismatchSince: 0,
+          clickCount: 0,
+          clickedAt: 0,
+          lastClickAt: 0,
+          clickedComposer: null,
+          clickedButton: null
+        };
+      } catch (_) {
+        clearPersistedJob();
+      }
+    }
+
+    function setDelayMs(value) {
+      delayMs = normalizeDelayMs(value);
+      persistSettings();
+      emitChange();
+      return delayMs;
+    }
+
+    function cancel(message = 'Отложенная отправка снята.') {
+      if (!job) return false;
+      clearJob({ status: message });
+      return true;
+    }
+
+    function arm() {
+      const context = resolveContext();
+      const composer = context?.composer;
+      if (!composer) {
+        setStatus('Не найдено обычное поле ChatGPT для таймера.');
+        return false;
+      }
+
+      const expectedNormalized = normalizeText(readText(composer));
+      if (!expectedNormalized) {
+        setStatus('Обычное поле ChatGPT пустое — таймер не поставлен.');
+        return false;
+      }
+
+      const timestamp = now();
+      job = {
+        phase: 'waiting',
+        deadline: timestamp + delayMs,
+        expectedNormalized,
+        routeKey: String(getRouteKey() || ''),
+        mismatchSince: 0,
+        clickCount: 0,
+        clickedAt: 0,
+        lastClickAt: 0,
+        clickedComposer: null,
+        clickedButton: null
+      };
+      lastStatus = '';
+      lastRenderedSecond = null;
+      persistWaitingJob();
+      emitChange();
+      console.info(`[ChatGPT notifier] Отложенная отправка включена на ${formatDelayedRemaining(delayMs)}.`);
+      return true;
+    }
+
+    function toggle() {
+      if (job) return cancel();
+      return arm();
+    }
+
+    function finishConfirmed(reason) {
+      console.info(`[ChatGPT notifier] Отложенная отправка подтверждена (${reason}).`);
+      clearJob({ status: 'Отложенное сообщение отправлено.' });
+      return true;
+    }
+
+    function fail(message) {
+      console.warn(`[ChatGPT notifier] ${message}`);
+      clearJob({ status: message });
+      return false;
+    }
+
+    function noteRemaining(timestamp) {
+      if (!job) return;
+      const second = Math.max(0, Math.ceil((job.deadline - timestamp) / 1000));
+      if (second === lastRenderedSecond) return;
+      lastRenderedSecond = second;
+      emitChange();
+    }
+
+    function currentGenerationActive() {
+      try { return Boolean(isGenerationActive()); } catch (_) { return false; }
+    }
+
+    function clickWithContext(context, timestamp, { retry = false } = {}) {
+      const composer = context?.composer;
+      const sendButton = context?.sendButton;
+      if (!job || !composer || !isSendReady(sendButton) || sendButton?.isConnected === false) return false;
+
+      const currentNormalized = normalizeText(readText(composer));
+      if (currentNormalized !== job.expectedNormalized) return false;
+
+      job.phase = 'confirm';
+      job.clickCount += 1;
+      job.clickedAt ||= timestamp;
+      job.lastClickAt = timestamp;
+      job.clickedComposer = composer;
+      job.clickedButton = sendButton;
+      clearPersistedJob(); // Never restore a click-in-flight after a reload: that could duplicate a send.
+      emitChange();
+
+      console.info(
+        `[ChatGPT notifier] Нажимаю штатный Send по таймеру${retry ? ` повторно (${job.clickCount}/${SEND_MAX_CLICKS})` : ''}.`
+      );
+      try {
+        sendButton.click();
+      } catch (error) {
+        console.warn('[ChatGPT notifier] Ошибка штатного Send по таймеру:', error);
+        return false;
+      }
+      return true;
+    }
+
+    function check(timestamp = now()) {
+      if (!job) return false;
+      if (String(getRouteKey() || '') !== job.routeKey) {
+        return cancel('Отложенная отправка снята: открыт другой чат.');
+      }
+
+      noteRemaining(timestamp);
+
+      if (job.phase === 'confirm') {
+        const clickedComposer = job.clickedComposer;
+        const clickedComposerConnected = Boolean(clickedComposer && clickedComposer.isConnected !== false);
+        const clickedComposerHasText = clickedComposerConnected
+          ? Boolean(normalizeText(readText(clickedComposer)))
+          : true;
+        const confirmation = evaluateDelayedSendConfirmation({
+          generationActive: currentGenerationActive(),
+          clickedComposerConnected,
+          clickedComposerHasText
+        });
+        if (confirmation.confirmed) return finishConfirmed(confirmation.reason);
+
+        if (timestamp - job.clickedAt >= SEND_CONFIRM_TIMEOUT_MS) {
+          return fail('Не удалось подтвердить отправку по таймеру; повторной отправки не будет.');
+        }
+
+        if (timestamp - job.lastClickAt < SEND_RETRY_DELAY_MS || job.clickCount >= SEND_MAX_CLICKS) return false;
+        const context = resolveContext();
+        const currentNormalized = normalizeText(readText(context?.composer));
+        if (!context?.composer || currentNormalized !== job.expectedNormalized || !isSendReady(context.sendButton)) return false;
+        return clickWithContext(context, timestamp, { retry: true });
+      }
+
+      const context = resolveContext();
+      if (context?.composer) {
+        const currentNormalized = normalizeText(readText(context.composer));
+        if (currentNormalized !== job.expectedNormalized) {
+          if (!job.mismatchSince) job.mismatchSince = timestamp;
+          if (timestamp - job.mismatchSince >= TEXT_MISMATCH_GRACE_MS) {
+            return cancel('Отложенная отправка снята: текст в поле ChatGPT изменился.');
+          }
+          return false;
+        }
+        job.mismatchSince = 0;
+      }
+
+      if (timestamp < job.deadline) return false;
+      if (currentGenerationActive()) return false;
+      if (!context?.composer || !isSendReady(context.sendButton)) return false;
+
+      return clickWithContext(context, timestamp);
+    }
+
+    function resetForNavigation() {
+      if (job) clearJob({ status: '', persist: true });
+      else clearPersistedJob();
+    }
+
+    function getRemainingMs(timestamp = now()) {
+      if (!job) return 0;
+      return Math.max(0, job.deadline - timestamp);
+    }
+
+    function getRemainingLabel(timestamp = now()) {
+      return job ? formatDelayedRemaining(getRemainingMs(timestamp)) : '';
+    }
+
+    loadPersistedState();
+
+    return {
+      arm,
+      toggle,
+      cancel,
+      check,
+      resetForNavigation,
+      setDelayMs,
+      getDelayMs: () => delayMs,
+      getRemainingMs,
+      getRemainingLabel,
+      getDeadline: () => job?.deadline || 0,
+      getLastStatus: () => lastStatus,
+      isActive: () => Boolean(job),
+      isConfirmingSend: () => job?.phase === 'confirm'
+    };
+  }
+
+  return {
+    DEFAULT_DELAY_MS,
+    MIN_DELAY_MS,
+    MAX_DELAY_MS,
+    normalizeDelayMs,
+    formatDelayedRemaining,
+    evaluateDelayedSendConfirmation,
+    createDelayedSendController
+  };
+});
+
+(function (root, factory) {
+  const deps = typeof require === 'function'
     ? Object.assign({}, require('./config.js'), require('./chatgpt-dom.js'), root.ChatGPTTabNotifier || {})
     : (root.ChatGPTTabNotifier || {});
   const api = factory(deps);
@@ -1823,7 +2170,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
   'use strict';
 
-  const UI_WIDTH = 74;
+  const UI_WIDTH = 114;
   const UI_HEIGHT = 34;
   const VIEWPORT_MARGIN = 6;
   const DRAG_THRESHOLD_PX = 8;
@@ -1837,7 +2184,7 @@
     };
   }
 
-  function createUploadButtonUi({ tabState, uploadController, queuedPromptController }) {
+  function createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController }) {
     let repositionTimer = null;
     let suppressClickUntil = 0;
     let dragState = null;
@@ -2034,17 +2381,21 @@
 
     function ensureUi() {
       let host = document.getElementById(deps.UPLOAD_HOST_ID);
-      if (host?.shadowRoot) {
+      if (host?.shadowRoot?.querySelector('[data-role="delay-send"]')) {
         return {
           host,
           row: host.shadowRoot.querySelector('.row'),
+          delayButton: host.shadowRoot.querySelector('[data-role="delay-send"]'),
           queueButton: host.shadowRoot.querySelector('[data-role="queue"]'),
           autoButton: host.shadowRoot.querySelector('[data-role="auto-send"]'),
+          timerChip: host.shadowRoot.querySelector('.timer-chip'),
           badge: host.shadowRoot.querySelector('.badge'),
           panel: host.shadowRoot.querySelector('.panel'),
           list: host.shadowRoot.querySelector('.queue-list'),
           empty: host.shadowRoot.querySelector('.empty'),
           status: host.shadowRoot.querySelector('.status'),
+          timerStatus: host.shadowRoot.querySelector('.timer-status'),
+          delaySelect: host.shadowRoot.querySelector('.delay-select'),
           sendAll: host.shadowRoot.querySelector('.send-all'),
           textarea: host.shadowRoot.querySelector('textarea'),
           add: host.shadowRoot.querySelector('.add'),
@@ -2088,6 +2439,8 @@
             box-shadow:0 0 0 2px rgba(37,99,235,.18),0 2px 10px rgba(0,0,0,.24);
           }
           [data-role="auto-send"][data-active="false"] { opacity:.72; }
+          [data-role="delay-send"] { font-size:18px; }
+          [data-role="delay-send"][data-active="true"] { background:#383838; border-color:rgba(255,255,255,.25); }
           [data-role="queue"] { font-size:24px; font-weight:300; position:relative; }
           [data-role="queue"][data-active="true"] { background:#383838; border-color:rgba(255,255,255,.25); }
           [data-role="queue"][data-sending="true"] { animation:pulse .8s ease-in-out infinite alternate; }
@@ -2098,14 +2451,16 @@
             background:#6d5dfc; color:#fff; font:600 10px/1 system-ui,sans-serif;
             pointer-events:none; box-shadow:0 1px 4px rgba(0,0,0,.35);
           }
-          .version-chip {
-            position:absolute; left:0; top:-22px; height:17px; padding:0 6px;
+          .meta-chip {
+            position:absolute; top:-22px; height:17px; padding:0 6px;
             display:inline-flex; align-items:center; justify-content:center; white-space:nowrap;
             border:1px solid rgba(128,128,128,.24); border-radius:999px;
             background:rgba(32,32,32,.88); color:rgba(255,255,255,.62);
             font:600 9px/1 system-ui,sans-serif; pointer-events:none;
             box-shadow:0 2px 8px rgba(0,0,0,.18);
           }
+          .version-chip { left:44px; }
+          .timer-chip { left:-4px; display:none; }
           .panel {
             position:absolute; left:0; bottom:44px; width:min(430px, calc(100vw - 24px));
             pointer-events:auto; font:13px/1.35 system-ui,sans-serif; color:#fff;
@@ -2150,6 +2505,18 @@
           }
           .send-all:hover:not(:disabled) { background:rgba(58,58,58,.98); color:#fff; }
           .send-all:disabled { opacity:.5; cursor:default; }
+          .delay-settings {
+            margin:0 0 7px; padding:8px 9px; border:1px solid rgba(128,128,128,.24); border-radius:10px;
+            background:rgba(40,40,40,.98); color:rgba(255,255,255,.72);
+          }
+          .delay-settings-row { display:flex; align-items:center; gap:8px; }
+          .delay-settings-title { font:600 11px/1.2 system-ui,sans-serif; white-space:nowrap; }
+          .delay-select {
+            margin-left:auto; min-width:106px; padding:5px 7px; border:1px solid rgba(128,128,128,.28); border-radius:7px;
+            background:rgba(30,30,30,.98); color:#eee; font:11px/1.2 system-ui,sans-serif; outline:none;
+          }
+          .delay-note { margin-top:5px; color:rgba(255,255,255,.34); font:10px/1.25 system-ui,sans-serif; }
+          .timer-status { display:none; margin-top:6px; color:rgba(255,255,255,.58); font:10px/1.3 system-ui,sans-serif; }
           .composer { padding:9px; border:1px solid rgba(128,128,128,.28); border-radius:14px; background:rgba(30,30,30,.98); box-shadow:0 12px 34px rgba(0,0,0,.34); }
           textarea { display:block; width:100%; min-height:66px; max-height:190px; resize:vertical; padding:4px 4px 7px; border:0; outline:none; background:transparent; color:#fff; font:13px/1.42 system-ui,sans-serif; }
           textarea::placeholder { color:rgba(255,255,255,.36); }
@@ -2173,6 +2540,23 @@
           <div class="empty">Очередь пуста</div>
           <div class="queue-list"></div>
           <button type="button" class="send-all">Отправить всё одним сообщением</button>
+          <div class="delay-settings">
+            <div class="delay-settings-row">
+              <span class="delay-settings-title">Отложенная отправка</span>
+              <select class="delay-select" aria-label="Время отложенной отправки">
+                <option value="30000">30 сек</option>
+                <option value="60000">1 мин</option>
+                <option value="120000">2 мин</option>
+                <option value="300000">5 мин</option>
+                <option value="600000">10 мин</option>
+                <option value="900000">15 мин</option>
+                <option value="1800000">30 мин</option>
+                <option value="3600000">1 час</option>
+              </select>
+            </div>
+            <div class="delay-note">◷ отправляет текущий текст. Спящая вкладка отправит сразу после пробуждения.</div>
+            <div class="timer-status"></div>
+          </div>
           <div class="composer">
             <textarea placeholder="Добавить следующее сообщение..."></textarea>
             <div class="composer-bottom">
@@ -2186,7 +2570,9 @@
         </div>
 
         <div class="row" aria-label="ChatGPT notifier controls">
-          <span class="version-chip"></span>
+          <span class="meta-chip timer-chip"></span>
+          <span class="meta-chip version-chip"></span>
+          <button type="button" class="control" data-role="delay-send" aria-label="Отложенная отправка текущего текста">◷</button>
           <button type="button" class="control" data-role="queue" aria-label="Очередь сообщений">+</button>
           <button type="button" class="control" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
           <span class="badge"></span>
@@ -2195,13 +2581,17 @@
       const ui = {
         host,
         row: shadow.querySelector('.row'),
+        delayButton: shadow.querySelector('[data-role="delay-send"]'),
         queueButton: shadow.querySelector('[data-role="queue"]'),
         autoButton: shadow.querySelector('[data-role="auto-send"]'),
+        timerChip: shadow.querySelector('.timer-chip'),
         badge: shadow.querySelector('.badge'),
         panel: shadow.querySelector('.panel'),
         list: shadow.querySelector('.queue-list'),
         empty: shadow.querySelector('.empty'),
         status: shadow.querySelector('.status'),
+        timerStatus: shadow.querySelector('.timer-status'),
+        delaySelect: shadow.querySelector('.delay-select'),
         sendAll: shadow.querySelector('.send-all'),
         textarea: shadow.querySelector('textarea'),
         add: shadow.querySelector('.add'),
@@ -2279,11 +2669,22 @@
         }
       });
 
+      ui.delayButton.addEventListener('click', event => {
+        if (clickWasDrag(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        delayedSendController?.toggle();
+      });
+
       ui.autoButton.addEventListener('click', event => {
         if (clickWasDrag(event)) return;
         event.preventDefault();
         event.stopPropagation();
         uploadController.toggle();
+      });
+
+      ui.delaySelect.addEventListener('change', () => {
+        delayedSendController?.setDelayMs(Number(ui.delaySelect.value));
       });
 
       ui.add.addEventListener('click', addCurrent);
@@ -2322,6 +2723,21 @@
       ui.autoButton.title = active
         ? 'Жду окончания загрузки файлов и затем автоматически отправлю. Нажать ещё раз — отменить.'
         : 'Когда файлы загружаются: нажать, чтобы после завершения автоматически отправить сообщение';
+
+      const delayActive = Boolean(delayedSendController?.isActive());
+      const remainingLabel = delayActive ? delayedSendController.getRemainingLabel() : '';
+      ui.delayButton.dataset.active = String(delayActive);
+      ui.delayButton.setAttribute('aria-pressed', String(delayActive));
+      ui.delayButton.title = delayActive
+        ? `Отложенная отправка через ${remainingLabel}. Нажать — снять таймер.`
+        : 'Поставить таймер на отправку текущего текста ChatGPT';
+      ui.timerChip.textContent = remainingLabel;
+      ui.timerChip.style.display = delayActive ? 'inline-flex' : 'none';
+      const selectedDelay = String(delayedSendController?.getDelayMs?.() || 300000);
+      if (ui.delaySelect.value !== selectedDelay) ui.delaySelect.value = selectedDelay;
+      const timerStatus = delayedSendController?.getLastStatus?.() || '';
+      ui.timerStatus.textContent = timerStatus;
+      ui.timerStatus.style.display = timerStatus ? 'block' : 'none';
 
       ui.versionChip.textContent = `v${deps.SCRIPT_VERSION}`;
       ui.panelVersion.textContent = `v${deps.SCRIPT_VERSION}`;
@@ -2517,6 +2933,7 @@
     let uploadUi = null;
     let uploadController = null;
     let queuedPromptController = null;
+    let delayedSendController = null;
 
     function scheduleUi() {
       uploadUi?.schedule();
@@ -2542,7 +2959,8 @@
 
     uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
     queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
-    uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController });
+    delayedSendController = deps.createDelayedSendController({ onChange: scheduleUi, isGenerationActive: deps.isGenerating });
+    uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController });
     let lastUrl = location.href;
 
     function recheckUploadSoon() {
@@ -2579,19 +2997,32 @@
     }, true);
 
     document.addEventListener('click', event => {
-      if (deps.isComposerSendButton(event.target)) responseMonitor.armAnswer('send-button');
+      if (!deps.isComposerSendButton(event.target)) return;
+      responseMonitor.armAnswer('send-button');
+      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
+        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
+      }
     }, true);
 
     document.addEventListener('keydown', event => {
       if (
         event.key === 'Enter' && !event.isComposing && !event.shiftKey && !event.ctrlKey &&
         !event.altKey && !event.metaKey && deps.isComposerTarget(event.target)
-      ) responseMonitor.armAnswer('enter-key');
+      ) {
+        responseMonitor.armAnswer('enter-key');
+        if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
+          delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
+        }
+      }
     }, true);
 
     document.addEventListener('submit', event => {
       if (typeof HTMLFormElement === 'undefined' || !(event.target instanceof HTMLFormElement)) return;
-      if (deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) responseMonitor.armAnswer('form-submit');
+      if (!deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) return;
+      responseMonitor.armAnswer('form-submit');
+      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
+        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
+      }
     }, true);
 
     function markViewed() {
@@ -2602,6 +3033,7 @@
     function handleForeground() {
       markViewed();
       recheckUploadSoon();
+      delayedSendController?.check();
       scheduleUi();
     }
 
@@ -2619,6 +3051,7 @@
       uploadController.reset({ clearMark: true, render: false });
       uploadController.resetFileHistory();
       queuedPromptController.resetForNavigation();
+      delayedSendController?.resetForNavigation();
       uploadUi.closeQueuePanel?.();
       tabState.resetForNavigation();
       setTimeout(responseMonitor.check, 400);
@@ -2650,12 +3083,14 @@
       responseMonitor.check();
       uploadController.check();
       queuedPromptController.attemptSend();
+      delayedSendController?.check();
       tickCount += 1;
       if (!document.hidden && tickCount % 6 === 0) scheduleUi();
     }, deps.SETTINGS.checkIntervalMs);
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand(`ℹ Версия: v${deps.SCRIPT_VERSION}`, () => console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION}`));
+      GM_registerMenuCommand('◷ Отложенная отправка текущего текста', delayedSendController.toggle);
       GM_registerMenuCommand('⇧ Автоотправка после загрузки файлов', uploadController.toggle);
       GM_registerMenuCommand('● Проверить уведомление', notifications.showDesktopNotification);
     }
@@ -2663,7 +3098,7 @@
     tabState.render();
     responseMonitor.check();
     scheduleUi();
-    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: + открывает очередь сообщений, ⇧ управляет автоотправкой файлов.`);
+    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — отложенная отправка, + — очередь, ⇧ — автоотправка файлов.`);
 
     return {
       dispose() {
@@ -2673,6 +3108,7 @@
       tabState,
       uploadController,
       queuedPromptController,
+      delayedSendController,
       responseMonitor,
       uploadUi
     };
