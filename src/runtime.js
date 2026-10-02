@@ -43,7 +43,8 @@
     delayedSendController = deps.createDelayedSendController({
       onChange: scheduleUi,
       isGenerationActive: deps.isGenerating,
-      isSendPipelineBusy: () => Boolean(queuedPromptController?.isWaitingToSend() || uploadController?.isConfirmingSend())
+      isSendPipelineBusy: () => Boolean(queuedPromptController?.isWaitingToSend() || uploadController?.isConfirmingSend()),
+      getAssistantSnapshot: deps.assistantSnapshot
     });
     uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController });
     let lastUrl = location.href;

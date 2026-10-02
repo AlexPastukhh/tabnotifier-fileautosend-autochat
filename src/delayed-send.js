@@ -45,6 +45,40 @@
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
   }
 
+  function normalizeAssistantSnapshot(snapshot) {
+    const count = Number(snapshot?.count);
+    const fingerprint = typeof snapshot?.fingerprint === 'string' ? snapshot.fingerprint : '';
+    if (!Number.isFinite(count) || count < 0 || !fingerprint) return null;
+    return { count: Math.floor(count), fingerprint };
+  }
+
+  function assistantFingerprintTextLength(snapshot) {
+    const normalized = normalizeAssistantSnapshot(snapshot);
+    if (!normalized) return null;
+    const match = normalized.fingerprint.match(/^\d+:(\d+):/);
+    if (!match) return null;
+    const length = Number(match[1]);
+    return Number.isFinite(length) ? length : null;
+  }
+
+  function evaluateCheckpointResponseGuard({ baseline = null, current = null } = {}) {
+    const before = normalizeAssistantSnapshot(baseline);
+    const latest = normalizeAssistantSnapshot(current);
+    if (!before || !latest) return { allow: false, answered: false, reason: 'snapshot-unavailable' };
+    if (latest.count < before.count) return { allow: false, answered: false, reason: 'snapshot-not-ready' };
+    if (latest.count > before.count) return { allow: false, answered: true, reason: 'assistant-count-advanced' };
+    if (latest.fingerprint === before.fingerprint) return { allow: true, answered: false, reason: 'unchanged' };
+
+    // After reload/sleep ChatGPT can hydrate the same assistant message progressively.
+    // A temporarily shorter snapshot is not proof of a new answer: fail closed and wait.
+    const beforeLength = assistantFingerprintTextLength(before);
+    const latestLength = assistantFingerprintTextLength(latest);
+    if (beforeLength !== null && latestLength !== null && latestLength < beforeLength) {
+      return { allow: false, answered: false, reason: 'snapshot-not-ready' };
+    }
+    return { allow: false, answered: true, reason: 'assistant-fingerprint-changed' };
+  }
+
   function evaluateDelayedSendConfirmation({
     generationActive = false,
     clickedComposerConnected = false,
@@ -61,6 +95,7 @@
     onChange = () => {},
     isGenerationActive = () => false,
     isSendPipelineBusy = () => false,
+    getAssistantSnapshot = () => null,
     storage = (typeof localStorage !== 'undefined' ? localStorage : null),
     now = () => Date.now(),
     getRouteKey = () => (typeof location !== 'undefined' ? location.href : ''),
@@ -114,7 +149,8 @@
         ? {
             deadline: checkpointJob.deadline,
             text: checkpointJob.text,
-            routeKey: checkpointJob.routeKey
+            routeKey: checkpointJob.routeKey,
+            assistantBaseline: checkpointJob.assistantBaseline
           }
         : null;
       const items = scheduledItems
@@ -170,14 +206,21 @@
         if (checkpoint) {
           const text = String(checkpoint.text || '').trim();
           const deadline = Number(checkpoint.deadline);
-          if (text && Number.isFinite(deadline) && String(checkpoint.routeKey || '') === routeKey) {
+          const assistantBaseline = normalizeAssistantSnapshot(checkpoint.assistantBaseline);
+          if (text && Number.isFinite(deadline) && String(checkpoint.routeKey || '') === routeKey && assistantBaseline) {
             checkpointJob = {
               phase: 'waiting',
               deadline,
               text,
               expectedNormalized: normalizeText(text),
-              routeKey
+              routeKey,
+              assistantBaseline
             };
+          } else if (text && Number.isFinite(deadline) && String(checkpoint.routeKey || '') === routeKey) {
+            // v5.6.0 did not persist the assistant baseline. Restoring such a
+            // checkpoint could send after an answer that arrived while sleeping,
+            // so discard only that checkpoint and keep delayed-list items.
+            lastStatus = 'Старый чекпоинт снят после обновления: невозможно проверить, был ли уже получен ответ.';
           }
         }
 
@@ -237,13 +280,19 @@
         setStatus('Введите текст чекпоинта перед запуском таймера.');
         return false;
       }
+      const assistantBaseline = currentAssistantSnapshot();
+      if (!assistantBaseline) {
+        setStatus('Не удалось зафиксировать состояние ответа ChatGPT — чекпоинт не поставлен.');
+        return false;
+      }
       const timestamp = now();
       checkpointJob = {
         phase: 'waiting',
         deadline: timestamp + delayMs,
         text,
         expectedNormalized: normalizeText(text),
-        routeKey: currentRouteKey()
+        routeKey: currentRouteKey(),
+        assistantBaseline
       };
       lastStatus = '';
       lastRenderSignature = '';
@@ -318,6 +367,46 @@
       try { return Boolean(isSendPipelineBusy()); } catch (_) { return false; }
     }
 
+    function currentAssistantSnapshot() {
+      try { return normalizeAssistantSnapshot(getAssistantSnapshot()); } catch (_) { return null; }
+    }
+
+    function checkpointResponseGuard(baseline) {
+      return evaluateCheckpointResponseGuard({ baseline, current: currentAssistantSnapshot() });
+    }
+
+    function clearOwnedCheckpointComposer(job, context = null) {
+      if (!job?.insertedByScript) return false;
+      const resolved = context || resolveContext();
+      const composer = resolved?.composer;
+      if (!composer) return false;
+      const currentNormalized = normalizeText(readText(composer));
+      if (!currentNormalized || currentNormalized !== job.expectedNormalized) return false;
+      try { return Boolean(setText(composer, '')); } catch (_) { return false; }
+    }
+
+    function cancelCheckpointForAnswer(job = activeSend, context = null, reason = 'assistant-response-detected') {
+      if (job?.kind === 'checkpoint') clearOwnedCheckpointComposer(job, context);
+      activeSend = activeSend?.kind === 'checkpoint' ? null : activeSend;
+      checkpointJob = null;
+      lastRenderSignature = '';
+      lastStatus = 'Ответ ChatGPT уже получен — чекпоинт снят.';
+      persistState();
+      emitChange();
+      console.info(`[ChatGPT notifier] Чекпоинт снят гардом ответа (${reason}).`);
+      return true;
+    }
+
+    function guardWaitingCheckpoint() {
+      if (!checkpointJob || checkpointJob.phase !== 'waiting') return null;
+      const guard = checkpointResponseGuard(checkpointJob.assistantBaseline);
+      if (guard.answered) {
+        cancelCheckpointForAnswer(activeSend?.kind === 'checkpoint' ? activeSend : null, null, guard.reason);
+        return { ...guard, cancelled: true };
+      }
+      return guard;
+    }
+
     function markTargetClickInFlight() {
       if (!activeSend) return;
       if (activeSend.kind === 'checkpoint') {
@@ -347,6 +436,12 @@
       if (!composer || !isSendReady(sendButton) || sendButton?.isConnected === false) return false;
       const currentNormalized = normalizeText(readText(composer));
       if (!currentNormalized || currentNormalized !== activeSend.expectedNormalized) return false;
+
+      if (activeSend.kind === 'checkpoint' && activeSend.clickCount === 0) {
+        const guard = checkpointResponseGuard(activeSend.assistantBaseline);
+        if (guard.answered) return cancelCheckpointForAnswer(activeSend, context, guard.reason);
+        if (!guard.allow) return false;
+      }
 
       activeSend.phase = 'confirm';
       activeSend.clickCount += 1;
@@ -440,6 +535,12 @@
       const composer = context?.composer;
       if (!composer) return false;
 
+      if (job.kind === 'checkpoint') {
+        const guard = checkpointResponseGuard(job.assistantBaseline);
+        if (guard.answered) return cancelCheckpointForAnswer(job, context, guard.reason);
+        if (!guard.allow) return false;
+      }
+
       const currentNormalized = normalizeText(readText(composer));
       if (!job.insertedByScript) {
         if (currentNormalized) return false; // Never overwrite unrelated user text.
@@ -460,10 +561,16 @@
       return clickActiveSend(context, timestamp);
     }
 
-    function dueCandidate(timestamp) {
+    function dueCandidate(timestamp, { checkpointAllowed = true } = {}) {
       const candidates = [];
-      if (checkpointJob?.phase === 'waiting' && checkpointJob.deadline <= timestamp) {
-        candidates.push({ kind: 'checkpoint', deadline: checkpointJob.deadline, text: checkpointJob.text, expectedNormalized: checkpointJob.expectedNormalized });
+      if (checkpointAllowed && checkpointJob?.phase === 'waiting' && checkpointJob.deadline <= timestamp) {
+        candidates.push({
+          kind: 'checkpoint',
+          deadline: checkpointJob.deadline,
+          text: checkpointJob.text,
+          expectedNormalized: checkpointJob.expectedNormalized,
+          assistantBaseline: checkpointJob.assistantBaseline
+        });
       }
       for (const item of scheduledItems) {
         if (item.state !== 'waiting' || item.deadline > timestamp) continue;
@@ -509,8 +616,14 @@
       }
 
       noteRemaining(timestamp);
+      const checkpointGuard = guardWaitingCheckpoint();
+      if (checkpointGuard?.cancelled) {
+        // Continue below so an unrelated due delayed-list item may still run.
+      }
       if (activeSend) return processActiveSend(timestamp);
-      const candidate = dueCandidate(timestamp);
+      const candidate = dueCandidate(timestamp, {
+        checkpointAllowed: checkpointJob ? Boolean(checkpointGuard?.allow) : false
+      });
       if (!candidate) return false;
       return startCandidate(candidate, timestamp);
     }
@@ -548,7 +661,12 @@
     }
 
     function hasDueWork(timestamp = now()) {
-      return Boolean(dueCandidate(timestamp));
+      let checkpointAllowed = false;
+      if (checkpointJob?.phase === 'waiting') {
+        const guard = checkpointResponseGuard(checkpointJob.assistantBaseline);
+        checkpointAllowed = Boolean(guard.allow);
+      }
+      return Boolean(dueCandidate(timestamp, { checkpointAllowed }));
     }
 
     loadPersistedState();
@@ -597,6 +715,8 @@
     delayMinutesToMs,
     formatDelayMinutes,
     formatDelayedRemaining,
+    normalizeAssistantSnapshot,
+    evaluateCheckpointResponseGuard,
     evaluateDelayedSendConfirmation,
     createDelayedSendController
   };
