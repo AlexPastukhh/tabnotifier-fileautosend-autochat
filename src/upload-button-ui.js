@@ -217,6 +217,45 @@
           : `ChatGPT notifier v${deps.SCRIPT_VERSION} · Открыть очередь сообщений`;
     }
 
+    function renderDelayedList(ui) {
+      const items = delayedSendController?.getScheduledItems?.() || [];
+      ui.delayedList.replaceChildren();
+
+      items.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'delayed-item';
+        row.dataset.state = item.state || 'waiting';
+
+        const number = document.createElement('span');
+        number.className = 'number';
+        number.textContent = String(index + 1);
+
+        const text = document.createElement('span');
+        text.className = 'queue-text';
+        text.textContent = item.text;
+        text.title = item.text;
+
+        const time = document.createElement('span');
+        time.className = 'delayed-time';
+        time.textContent = item.state === 'uncertain' ? '?' : item.remainingLabel;
+        time.title = item.state === 'uncertain'
+          ? 'Отправка была начата, но результат не удалось надёжно подтвердить. Автоповтора нет.'
+          : `Осталось: ${item.remainingLabel}`;
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'item-action remove';
+        remove.textContent = '×';
+        remove.title = 'Удалить из отложенных';
+        remove.addEventListener('click', () => delayedSendController?.removeScheduled?.(item.id));
+
+        row.append(number, text, time, remove);
+        ui.delayedList.appendChild(row);
+      });
+
+      ui.delayedSection.style.display = items.length ? 'block' : 'none';
+    }
+
     function ensureUi() {
       let host = document.getElementById(deps.UPLOAD_HOST_ID);
       if (host?.shadowRoot?.querySelector('[data-role="delay-send"]')) {
@@ -234,9 +273,14 @@
           status: host.shadowRoot.querySelector('.status'),
           timerStatus: host.shadowRoot.querySelector('.timer-status'),
           delaySelect: host.shadowRoot.querySelector('.delay-select'),
+          delayMinutes: host.shadowRoot.querySelector('.delay-minutes'),
+          checkpointInput: host.shadowRoot.querySelector('.checkpoint-input'),
+          delayedSection: host.shadowRoot.querySelector('.delayed-section'),
+          delayedList: host.shadowRoot.querySelector('.delayed-list'),
           sendAll: host.shadowRoot.querySelector('.send-all'),
-          textarea: host.shadowRoot.querySelector('textarea'),
+          textarea: host.shadowRoot.querySelector('.queue-input'),
           add: host.shadowRoot.querySelector('.add'),
+          scheduleLater: host.shadowRoot.querySelector('.schedule-later'),
           fromChat: host.shadowRoot.querySelector('.from-chat'),
           versionChip: host.shadowRoot.querySelector('.version-chip'),
           panelVersion: host.shadowRoot.querySelector('.panel-version')
@@ -353,22 +397,45 @@
             margin-left:auto; min-width:106px; padding:5px 7px; border:1px solid rgba(128,128,128,.28); border-radius:7px;
             background:rgba(30,30,30,.98); color:#eee; font:11px/1.2 system-ui,sans-serif; outline:none;
           }
+          .delay-manual-row { display:flex; align-items:center; gap:7px; margin-top:7px; }
+          .delay-manual-label { color:rgba(255,255,255,.50); font:10px/1.2 system-ui,sans-serif; }
+          .delay-minutes {
+            width:76px; margin-left:auto; padding:5px 7px; border:1px solid rgba(128,128,128,.28); border-radius:7px;
+            background:rgba(30,30,30,.98); color:#eee; font:11px/1.2 system-ui,sans-serif; outline:none;
+          }
+          .delay-unit { color:rgba(255,255,255,.46); font:10px/1 system-ui,sans-serif; }
           .delay-note { margin-top:5px; color:rgba(255,255,255,.34); font:10px/1.25 system-ui,sans-serif; }
-          .timer-status { display:none; margin-top:6px; color:rgba(255,255,255,.58); font:10px/1.3 system-ui,sans-serif; }
-          .composer { padding:9px; border:1px solid rgba(128,128,128,.28); border-radius:14px; background:rgba(30,30,30,.98); box-shadow:0 12px 34px rgba(0,0,0,.34); }
+          .checkpoint-label { margin-top:8px; color:rgba(255,255,255,.62); font:600 10px/1.2 system-ui,sans-serif; }
           textarea { display:block; width:100%; min-height:66px; max-height:190px; resize:vertical; padding:4px 4px 7px; border:0; outline:none; background:transparent; color:#fff; font:13px/1.42 system-ui,sans-serif; }
           textarea::placeholder { color:rgba(255,255,255,.36); }
-          .composer-bottom { display:flex; align-items:center; gap:7px; }
-          .actions-left { display:flex; align-items:center; gap:7px; min-width:0; }
+          .checkpoint-input {
+            min-height:52px; max-height:120px; margin-top:5px; padding:7px 8px; border:1px solid rgba(128,128,128,.24);
+            border-radius:8px; background:rgba(30,30,30,.72); font-size:11px;
+          }
+          .timer-status { display:none; margin-top:6px; color:rgba(255,255,255,.58); font:10px/1.3 system-ui,sans-serif; }
+          .delayed-section { display:none; margin:0 0 7px; }
+          .section-title { margin:0 0 5px; color:rgba(255,255,255,.54); font:600 10px/1.2 system-ui,sans-serif; }
+          .delayed-list { max-height:150px; overflow-y:auto; scrollbar-width:thin; }
+          .delayed-item {
+            display:flex; align-items:center; gap:7px; min-height:38px; margin-bottom:5px; padding:6px 8px;
+            border:1px solid rgba(128,128,128,.24); border-radius:10px; background:rgba(43,43,43,.98);
+          }
+          .delayed-item[data-state="uncertain"] { border-color:rgba(202,153,58,.62); }
+          .delayed-time { flex:0 0 auto; color:rgba(255,255,255,.62); font:600 10px/1 system-ui,sans-serif; }
+          .composer { padding:9px; border:1px solid rgba(128,128,128,.28); border-radius:14px; background:rgba(30,30,30,.98); box-shadow:0 12px 34px rgba(0,0,0,.34); }
+          .composer-bottom { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+          .actions-left { display:flex; align-items:center; gap:7px; min-width:0; flex-wrap:wrap; }
           .hint { margin-left:auto; color:rgba(255,255,255,.32); font:10px/1 system-ui,sans-serif; white-space:nowrap; }
-          .add,.from-chat {
+          .add,.schedule-later,.from-chat {
             border:1px solid rgba(128,128,128,.28); border-radius:8px; padding:7px 11px; cursor:pointer;
             background:rgba(48,48,48,.98); color:#eee; font:600 12px/1 system-ui,sans-serif; white-space:nowrap;
           }
-          .add:hover,.from-chat:hover { background:rgba(64,64,64,.98); color:#fff; }
+          .add:hover,.schedule-later:hover,.from-chat:hover { background:rgba(64,64,64,.98); color:#fff; }
+          .schedule-later { background:rgba(48,58,78,.98); border-color:rgba(100,149,237,.34); }
+          .schedule-later:hover { background:rgba(59,73,101,.98); }
           .from-chat { background:rgba(53,51,74,.98); border-color:rgba(109,93,252,.38); }
           .from-chat:hover { background:rgba(72,68,101,.98); }
-          .add:disabled,.from-chat:disabled { opacity:.48; cursor:default; }
+          .add:disabled,.schedule-later:disabled,.from-chat:disabled { opacity:.48; cursor:default; }
           .status { display:none; margin:0 0 7px; padding:7px 9px; border-radius:9px; background:rgba(127,45,45,.38); color:#ffd7d7; font:11px/1.35 system-ui,sans-serif; }
         </style>
 
@@ -380,7 +447,7 @@
           <button type="button" class="send-all">Отправить всё одним сообщением</button>
           <div class="delay-settings">
             <div class="delay-settings-row">
-              <span class="delay-settings-title">Отложенная отправка</span>
+              <span class="delay-settings-title">Задержка</span>
               <select class="delay-select" aria-label="Время отложенной отправки">
                 <option value="30000">30 сек</option>
                 <option value="60000">1 мин</option>
@@ -390,16 +457,29 @@
                 <option value="900000">15 мин</option>
                 <option value="1800000">30 мин</option>
                 <option value="3600000">1 час</option>
+                <option value="custom">Своё время</option>
               </select>
             </div>
-            <div class="delay-note">◷ отправляет текущий текст. Спящая вкладка отправит сразу после пробуждения.</div>
+            <div class="delay-manual-row">
+              <span class="delay-manual-label">Свои минуты</span>
+              <input class="delay-minutes" type="text" inputmode="decimal" autocomplete="off" aria-label="Своё количество минут">
+              <span class="delay-unit">мин</span>
+            </div>
+            <div class="delay-note">Эта задержка используется и для чекпоинта ◷, и для кнопки «Отправить позже». Спящая вкладка догонит просроченное после пробуждения.</div>
+            <div class="checkpoint-label">Фиксированный текст чекпоинта для ◷</div>
+            <textarea class="checkpoint-input" placeholder="Например: Проверь текущий прогресс и продолжай с последнего чекпоинта..."></textarea>
             <div class="timer-status"></div>
           </div>
+          <div class="delayed-section">
+            <div class="section-title">Отправятся позже</div>
+            <div class="delayed-list"></div>
+          </div>
           <div class="composer">
-            <textarea placeholder="Добавить следующее сообщение..."></textarea>
+            <textarea class="queue-input" placeholder="Добавить следующее сообщение..."></textarea>
             <div class="composer-bottom">
               <div class="actions-left">
                 <button type="button" class="add">В очередь</button>
+                <button type="button" class="schedule-later">Отправить позже</button>
                 <button type="button" class="from-chat" title="Перенести весь текст из обычного поля ChatGPT в очередь">Из чата → очередь</button>
               </div>
               <span class="hint">Ctrl/⌘ + Enter</span>
@@ -410,7 +490,7 @@
         <div class="row" aria-label="ChatGPT notifier controls">
           <span class="meta-chip timer-chip"></span>
           <span class="meta-chip version-chip"></span>
-          <button type="button" class="control" data-role="delay-send" aria-label="Отложенная отправка текущего текста">◷</button>
+          <button type="button" class="control" data-role="delay-send" aria-label="Чекпоинт по таймеру">◷</button>
           <button type="button" class="control" data-role="queue" aria-label="Очередь сообщений">+</button>
           <button type="button" class="control" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
           <span class="badge"></span>
@@ -430,9 +510,14 @@
         status: shadow.querySelector('.status'),
         timerStatus: shadow.querySelector('.timer-status'),
         delaySelect: shadow.querySelector('.delay-select'),
+        delayMinutes: shadow.querySelector('.delay-minutes'),
+        checkpointInput: shadow.querySelector('.checkpoint-input'),
+        delayedSection: shadow.querySelector('.delayed-section'),
+        delayedList: shadow.querySelector('.delayed-list'),
         sendAll: shadow.querySelector('.send-all'),
-        textarea: shadow.querySelector('textarea'),
+        textarea: shadow.querySelector('.queue-input'),
         add: shadow.querySelector('.add'),
+        scheduleLater: shadow.querySelector('.schedule-later'),
         fromChat: shadow.querySelector('.from-chat'),
         versionChip: shadow.querySelector('.version-chip'),
         panelVersion: shadow.querySelector('.panel-version')
@@ -444,6 +529,14 @@
       function addCurrent() {
         if (!queuedPromptController) return;
         const id = queuedPromptController.add(ui.textarea.value);
+        if (!id) return;
+        ui.textarea.value = '';
+        render();
+        setTimeout(() => ui.textarea.focus(), 0);
+      }
+
+      function scheduleCurrent() {
+        const id = delayedSendController?.addScheduled?.(ui.textarea.value);
         if (!id) return;
         ui.textarea.value = '';
         render();
@@ -511,7 +604,11 @@
         if (clickWasDrag(event)) return;
         event.preventDefault();
         event.stopPropagation();
-        delayedSendController?.toggle();
+        delayedSendController?.toggleCheckpoint?.();
+        // The general UI scheduler is intentionally debounced for DOM churn, but
+        // this control needs immediate visual feedback. Without this render a fast
+        // second click can cancel the timer before the active state/chip ever appears.
+        render();
       });
 
       ui.autoButton.addEventListener('click', event => {
@@ -522,10 +619,35 @@
       });
 
       ui.delaySelect.addEventListener('change', () => {
+        if (ui.delaySelect.value === 'custom') {
+          ui.delayMinutes.focus();
+          ui.delayMinutes.select?.();
+          return;
+        }
         delayedSendController?.setDelayMs(Number(ui.delaySelect.value));
+        render();
+      });
+
+      function applyManualDelay() {
+        const result = delayedSendController?.setDelayMinutes?.(ui.delayMinutes.value);
+        if (result !== false) render();
+      }
+
+      ui.delayMinutes.addEventListener('change', applyManualDelay);
+      ui.delayMinutes.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        applyManualDelay();
+        ui.delayMinutes.blur();
+      });
+
+      ui.checkpointInput.value = delayedSendController?.getCheckpointText?.() || '';
+      ui.checkpointInput.addEventListener('input', () => {
+        delayedSendController?.setCheckpointText?.(ui.checkpointInput.value);
       });
 
       ui.add.addEventListener('click', addCurrent);
+      ui.scheduleLater.addEventListener('click', scheduleCurrent);
       ui.fromChat.addEventListener('click', () => queuedPromptController?.addFromComposer());
       ui.sendAll.addEventListener('click', () => queuedPromptController?.sendAllNow());
       ui.textarea.addEventListener('keydown', event => {
@@ -562,17 +684,27 @@
         ? 'Жду окончания загрузки файлов и затем автоматически отправлю. Нажать ещё раз — отменить.'
         : 'Когда файлы загружаются: нажать, чтобы после завершения автоматически отправить сообщение';
 
-      const delayActive = Boolean(delayedSendController?.isActive());
-      const remainingLabel = delayActive ? delayedSendController.getRemainingLabel() : '';
+      const delayActive = Boolean(delayedSendController?.isCheckpointActive?.());
+      const remainingLabel = delayActive ? delayedSendController.getCheckpointRemainingLabel() : '';
       ui.delayButton.dataset.active = String(delayActive);
       ui.delayButton.setAttribute('aria-pressed', String(delayActive));
       ui.delayButton.title = delayActive
-        ? `Отложенная отправка через ${remainingLabel}. Нажать — снять таймер.`
-        : 'Поставить таймер на отправку текущего текста ChatGPT';
+        ? `Чекпоинт через ${remainingLabel}. Нажать — снять таймер.`
+        : 'Поставить таймер на фиксированный текст чекпоинта';
       ui.timerChip.textContent = remainingLabel;
       ui.timerChip.style.display = delayActive ? 'inline-flex' : 'none';
       const selectedDelay = String(delayedSendController?.getDelayMs?.() || 300000);
-      if (ui.delaySelect.value !== selectedDelay) ui.delaySelect.value = selectedDelay;
+      const hasPreset = Array.from(ui.delaySelect.options).some(option => option.value === selectedDelay);
+      const selectValue = hasPreset ? selectedDelay : 'custom';
+      if (ui.delaySelect.value !== selectValue) ui.delaySelect.value = selectValue;
+      const manualMinutes = delayedSendController?.getDelayMinutes?.() || '5';
+      if (document.activeElement !== ui.delayMinutes && ui.delayMinutes.value !== String(manualMinutes)) {
+        ui.delayMinutes.value = String(manualMinutes);
+      }
+      const checkpointText = delayedSendController?.getCheckpointText?.() || '';
+      if (document.activeElement !== ui.checkpointInput && ui.checkpointInput.value !== checkpointText) {
+        ui.checkpointInput.value = checkpointText;
+      }
       const timerStatus = delayedSendController?.getLastStatus?.() || '';
       ui.timerStatus.textContent = timerStatus;
       ui.timerStatus.style.display = timerStatus ? 'block' : 'none';
@@ -580,6 +712,7 @@
       ui.versionChip.textContent = `v${deps.SCRIPT_VERSION}`;
       ui.panelVersion.textContent = `v${deps.SCRIPT_VERSION}`;
       renderQueueList(ui);
+      renderDelayedList(ui);
       positionPanel(host, ui.panel);
     }
 

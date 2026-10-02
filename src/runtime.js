@@ -30,12 +30,21 @@
           uploadController?.reset({ clearMark: true, render: false, clearFileHistory: true });
         }
       },
-      onFinished: () => queuedPromptController?.handleResponseFinished()
+      onFinished: () => {
+        delayedSendController?.check();
+        if (!delayedSendController?.isSending?.() && !delayedSendController?.hasDueWork?.()) {
+          queuedPromptController?.handleResponseFinished();
+        }
+      }
     });
 
     uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
     queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
-    delayedSendController = deps.createDelayedSendController({ onChange: scheduleUi, isGenerationActive: deps.isGenerating });
+    delayedSendController = deps.createDelayedSendController({
+      onChange: scheduleUi,
+      isGenerationActive: deps.isGenerating,
+      isSendPipelineBusy: () => Boolean(queuedPromptController?.isWaitingToSend() || uploadController?.isConfirmingSend())
+    });
     uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController });
     let lastUrl = location.href;
 
@@ -75,9 +84,6 @@
     document.addEventListener('click', event => {
       if (!deps.isComposerSendButton(event.target)) return;
       responseMonitor.armAnswer('send-button');
-      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
-        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
-      }
     }, true);
 
     document.addEventListener('keydown', event => {
@@ -86,9 +92,6 @@
         !event.altKey && !event.metaKey && deps.isComposerTarget(event.target)
       ) {
         responseMonitor.armAnswer('enter-key');
-        if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
-          delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
-        }
       }
     }, true);
 
@@ -96,9 +99,6 @@
       if (typeof HTMLFormElement === 'undefined' || !(event.target instanceof HTMLFormElement)) return;
       if (!deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) return;
       responseMonitor.armAnswer('form-submit');
-      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
-        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
-      }
     }, true);
 
     function markViewed() {
@@ -158,15 +158,15 @@
       if (location.href !== lastUrl) resetForNavigation();
       responseMonitor.check();
       uploadController.check();
-      queuedPromptController.attemptSend();
       delayedSendController?.check();
+      queuedPromptController.attemptSend();
       tickCount += 1;
       if (!document.hidden && tickCount % 6 === 0) scheduleUi();
     }, deps.SETTINGS.checkIntervalMs);
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand(`ℹ Версия: v${deps.SCRIPT_VERSION}`, () => console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION}`));
-      GM_registerMenuCommand('◷ Отложенная отправка текущего текста', delayedSendController.toggle);
+      GM_registerMenuCommand('◷ Чекпоинт по таймеру', delayedSendController.toggleCheckpoint);
       GM_registerMenuCommand('⇧ Автоотправка после загрузки файлов', uploadController.toggle);
       GM_registerMenuCommand('● Проверить уведомление', notifications.showDesktopNotification);
     }
@@ -174,7 +174,7 @@
     tabState.render();
     responseMonitor.check();
     scheduleUi();
-    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — отложенная отправка, + — очередь, ⇧ — автоотправка файлов.`);
+    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — чекпоинт по таймеру, + — очередь/отложенные, ⇧ — автоотправка файлов.`);
 
     return {
       dispose() {

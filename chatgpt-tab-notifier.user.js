@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.5.0
+// @version      5.6.0
 // @description  Статусы вкладки + автоотправка файлов + очередь сообщений + отложенная отправка + перетаскиваемые кнопки
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -21,7 +21,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.5.0';
+  const SCRIPT_VERSION = '5.6.0';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -1826,17 +1826,29 @@
   const DEFAULT_DELAY_MS = 5 * 60 * 1000;
   const MIN_DELAY_MS = 10 * 1000;
   const MAX_DELAY_MS = 24 * 60 * 60 * 1000;
-  const TEXT_MISMATCH_GRACE_MS = 700;
   const SEND_RETRY_DELAY_MS = 1600;
   const SEND_CONFIRM_TIMEOUT_MS = 10000;
   const SEND_MAX_CLICKS = 3;
   const SETTINGS_KEY = 'chatgpt-tab-notifier-delayed-send-settings-v1';
-  const STATE_KEY = 'chatgpt-tab-notifier-delayed-send-state-v1';
+  const STATE_KEY = 'chatgpt-tab-notifier-delayed-send-state-v2';
+  const LEGACY_STATE_KEY = 'chatgpt-tab-notifier-delayed-send-state-v1';
 
   function normalizeDelayMs(value) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return DEFAULT_DELAY_MS;
     return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, Math.round(numeric)));
+  }
+
+  function delayMinutesToMs(value) {
+    const numeric = Number(String(value ?? '').trim().replace(',', '.'));
+    if (!Number.isFinite(numeric) || numeric <= 0) return null;
+    return normalizeDelayMs(numeric * 60 * 1000);
+  }
+
+  function formatDelayMinutes(ms) {
+    const minutes = normalizeDelayMs(ms) / (60 * 1000);
+    if (Number.isInteger(minutes)) return String(minutes);
+    return String(Math.round(minutes * 100) / 100);
   }
 
   function formatDelayedRemaining(ms) {
@@ -1863,18 +1875,24 @@
   function createDelayedSendController({
     onChange = () => {},
     isGenerationActive = () => false,
+    isSendPipelineBusy = () => false,
     storage = (typeof localStorage !== 'undefined' ? localStorage : null),
     now = () => Date.now(),
     getRouteKey = () => (typeof location !== 'undefined' ? location.href : ''),
     resolveContext = () => deps.findComposerContext?.(),
     isSendReady = button => deps.isSendButtonReady?.(button),
     readText = composer => deps.readComposerText?.(composer) || '',
+    setText = (composer, value) => deps.setComposerText?.(composer, value),
     normalizeText = value => deps.normalizeComposerTextForOwnership?.(value) || String(value || '').trim()
   } = {}) {
     let delayMs = DEFAULT_DELAY_MS;
-    let job = null;
+    let checkpointText = '';
+    let checkpointJob = null;
+    let scheduledItems = [];
+    let activeSend = null;
     let lastStatus = '';
-    let lastRenderedSecond = null;
+    let lastRenderSignature = '';
+    let nextId = 1;
 
     function emitChange() {
       try { onChange(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка обновления таймера:', error); }
@@ -1892,24 +1910,44 @@
       try { storage?.removeItem?.(key); } catch (_) {}
     }
 
-    function persistSettings() {
-      storageSet(SETTINGS_KEY, JSON.stringify({ delayMs }));
+    function makeId() {
+      if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+      return `d-${Date.now().toString(36)}-${(nextId++).toString(36)}`;
     }
 
-    function persistWaitingJob() {
-      if (!job || job.phase !== 'waiting') {
+    function currentRouteKey() {
+      return String(getRouteKey() || '');
+    }
+
+    function persistSettings() {
+      storageSet(SETTINGS_KEY, JSON.stringify({ delayMs, checkpointText }));
+    }
+
+    function persistState() {
+      const routeKey = currentRouteKey();
+      const checkpoint = checkpointJob && checkpointJob.phase === 'waiting' && checkpointJob.routeKey === routeKey
+        ? {
+            deadline: checkpointJob.deadline,
+            text: checkpointJob.text,
+            routeKey: checkpointJob.routeKey
+          }
+        : null;
+      const items = scheduledItems
+        .filter(item => item.routeKey === routeKey)
+        .map(item => ({
+          id: item.id,
+          text: item.text,
+          deadline: item.deadline,
+          routeKey: item.routeKey,
+          state: item.state === 'uncertain' ? 'uncertain' : 'waiting',
+          createdAt: item.createdAt
+        }));
+
+      if (!checkpoint && !items.length) {
         storageRemove(STATE_KEY);
         return;
       }
-      storageSet(STATE_KEY, JSON.stringify({
-        deadline: job.deadline,
-        expectedNormalized: job.expectedNormalized,
-        routeKey: job.routeKey
-      }));
-    }
-
-    function clearPersistedJob() {
-      storageRemove(STATE_KEY);
+      storageSet(STATE_KEY, JSON.stringify({ routeKey, checkpoint, items }));
     }
 
     function setStatus(message) {
@@ -1917,11 +1955,9 @@
       emitChange();
     }
 
-    function clearJob({ status = '', persist = true } = {}) {
-      job = null;
-      lastRenderedSecond = null;
-      if (persist) clearPersistedJob();
-      lastStatus = String(status || '');
+    function clearStatus() {
+      if (!lastStatus) return;
+      lastStatus = '';
       emitChange();
     }
 
@@ -1929,148 +1965,267 @@
       try {
         const settings = JSON.parse(storageGet(SETTINGS_KEY) || 'null');
         if (settings?.delayMs) delayMs = normalizeDelayMs(settings.delayMs);
+        if (typeof settings?.checkpointText === 'string') checkpointText = settings.checkpointText;
       } catch (_) {}
+
+      // v1 stored the old "send whatever is currently in ChatGPT composer" job.
+      // It is intentionally not migrated into the new fixed-checkpoint model.
+      storageRemove(LEGACY_STATE_KEY);
 
       try {
         const saved = JSON.parse(storageGet(STATE_KEY) || 'null');
         if (!saved) return;
-        const deadline = Number(saved.deadline);
-        const expectedNormalized = normalizeText(saved.expectedNormalized);
-        const routeKey = String(saved.routeKey || '');
-        if (!Number.isFinite(deadline) || !expectedNormalized || routeKey !== String(getRouteKey() || '')) {
-          clearPersistedJob();
+        const routeKey = currentRouteKey();
+        if (String(saved.routeKey || '') !== routeKey) {
+          storageRemove(STATE_KEY);
           return;
         }
-        job = {
-          phase: 'waiting',
-          deadline,
-          expectedNormalized,
-          routeKey,
-          mismatchSince: 0,
-          clickCount: 0,
-          clickedAt: 0,
-          lastClickAt: 0,
-          clickedComposer: null,
-          clickedButton: null
-        };
+
+        const checkpoint = saved.checkpoint;
+        if (checkpoint) {
+          const text = String(checkpoint.text || '').trim();
+          const deadline = Number(checkpoint.deadline);
+          if (text && Number.isFinite(deadline) && String(checkpoint.routeKey || '') === routeKey) {
+            checkpointJob = {
+              phase: 'waiting',
+              deadline,
+              text,
+              expectedNormalized: normalizeText(text),
+              routeKey
+            };
+          }
+        }
+
+        const rawItems = Array.isArray(saved.items) ? saved.items : [];
+        scheduledItems = rawItems.flatMap(item => {
+          const text = String(item?.text || '').trim();
+          const deadline = Number(item?.deadline);
+          if (!text || !Number.isFinite(deadline) || String(item?.routeKey || '') !== routeKey) return [];
+          return [{
+            id: String(item.id || makeId()),
+            text,
+            expectedNormalized: normalizeText(text),
+            deadline,
+            routeKey,
+            state: item.state === 'uncertain' ? 'uncertain' : 'waiting',
+            createdAt: Number(item.createdAt) || now()
+          }];
+        });
       } catch (_) {
-        clearPersistedJob();
+        checkpointJob = null;
+        scheduledItems = [];
+        storageRemove(STATE_KEY);
       }
     }
 
     function setDelayMs(value) {
       delayMs = normalizeDelayMs(value);
+      lastStatus = '';
       persistSettings();
       emitChange();
       return delayMs;
     }
 
-    function cancel(message = 'Отложенная отправка снята.') {
-      if (!job) return false;
-      clearJob({ status: message });
-      return true;
+    function setDelayMinutes(value) {
+      const next = delayMinutesToMs(value);
+      if (next === null) {
+        setStatus('Введите количество минут больше нуля.');
+        return false;
+      }
+      delayMs = next;
+      lastStatus = '';
+      persistSettings();
+      emitChange();
+      return delayMs;
     }
 
-    function arm() {
-      const context = resolveContext();
-      const composer = context?.composer;
-      if (!composer) {
-        setStatus('Не найдено обычное поле ChatGPT для таймера.');
+    function setCheckpointText(value) {
+      checkpointText = String(value ?? '');
+      persistSettings();
+      return checkpointText;
+    }
+
+    function armCheckpoint() {
+      if (checkpointJob) return false;
+      const text = String(checkpointText || '').trim();
+      if (!text) {
+        setStatus('Введите текст чекпоинта перед запуском таймера.');
         return false;
       }
-
-      const expectedNormalized = normalizeText(readText(composer));
-      if (!expectedNormalized) {
-        setStatus('Обычное поле ChatGPT пустое — таймер не поставлен.');
-        return false;
-      }
-
       const timestamp = now();
-      job = {
+      checkpointJob = {
         phase: 'waiting',
         deadline: timestamp + delayMs,
-        expectedNormalized,
-        routeKey: String(getRouteKey() || ''),
-        mismatchSince: 0,
-        clickCount: 0,
-        clickedAt: 0,
-        lastClickAt: 0,
-        clickedComposer: null,
-        clickedButton: null
+        text,
+        expectedNormalized: normalizeText(text),
+        routeKey: currentRouteKey()
       };
       lastStatus = '';
-      lastRenderedSecond = null;
-      persistWaitingJob();
+      lastRenderSignature = '';
+      persistState();
       emitChange();
-      console.info(`[ChatGPT notifier] Отложенная отправка включена на ${formatDelayedRemaining(delayMs)}.`);
+      console.info(`[ChatGPT notifier] Чекпоинт поставлен на ${formatDelayedRemaining(delayMs)}.`);
       return true;
     }
 
-    function toggle() {
-      if (job) return cancel();
-      return arm();
-    }
-
-    function finishConfirmed(reason) {
-      console.info(`[ChatGPT notifier] Отложенная отправка подтверждена (${reason}).`);
-      clearJob({ status: 'Отложенное сообщение отправлено.' });
+    function cancelCheckpoint(message = 'Таймер чекпоинта снят.') {
+      if (!checkpointJob) return false;
+      if (activeSend?.kind === 'checkpoint') {
+        setStatus('Чекпоинт уже начал отправляться; отмена на этом этапе заблокирована.');
+        return false;
+      }
+      checkpointJob = null;
+      lastRenderSignature = '';
+      persistState();
+      setStatus(message);
       return true;
     }
 
-    function fail(message) {
-      console.warn(`[ChatGPT notifier] ${message}`);
-      clearJob({ status: message });
-      return false;
+    function toggleCheckpoint() {
+      if (checkpointJob) return cancelCheckpoint();
+      return armCheckpoint();
     }
 
-    function noteRemaining(timestamp) {
-      if (!job) return;
-      const second = Math.max(0, Math.ceil((job.deadline - timestamp) / 1000));
-      if (second === lastRenderedSecond) return;
-      lastRenderedSecond = second;
+    function addScheduled(text) {
+      const value = String(text || '').trim();
+      if (!value) {
+        setStatus('Введите сообщение перед добавлением в отложенные.');
+        return null;
+      }
+      const timestamp = now();
+      const item = {
+        id: makeId(),
+        text: value,
+        expectedNormalized: normalizeText(value),
+        deadline: timestamp + delayMs,
+        routeKey: currentRouteKey(),
+        state: 'waiting',
+        createdAt: timestamp
+      };
+      scheduledItems.push(item);
+      lastStatus = '';
+      lastRenderSignature = '';
+      persistState();
       emitChange();
+      console.info(`[ChatGPT notifier] Сообщение добавлено в отложенные на ${formatDelayedRemaining(delayMs)}.`);
+      return item.id;
+    }
+
+    function removeScheduled(id) {
+      const item = scheduledItems.find(entry => entry.id === id);
+      if (!item) return false;
+      if (activeSend?.kind === 'scheduled' && activeSend.itemId === id) {
+        setStatus('Это сообщение уже начало отправляться; удаление на этом этапе заблокировано.');
+        return false;
+      }
+      scheduledItems = scheduledItems.filter(entry => entry.id !== id);
+      lastRenderSignature = '';
+      persistState();
+      emitChange();
+      return true;
     }
 
     function currentGenerationActive() {
       try { return Boolean(isGenerationActive()); } catch (_) { return false; }
     }
 
-    function clickWithContext(context, timestamp, { retry = false } = {}) {
+    function currentPipelineBusy() {
+      try { return Boolean(isSendPipelineBusy()); } catch (_) { return false; }
+    }
+
+    function markTargetClickInFlight() {
+      if (!activeSend) return;
+      if (activeSend.kind === 'checkpoint') {
+        if (checkpointJob) checkpointJob.phase = 'confirm';
+      } else {
+        const item = scheduledItems.find(entry => entry.id === activeSend.itemId);
+        if (item) item.state = 'uncertain';
+      }
+      persistState();
+    }
+
+    function restoreTargetAfterClickFailure() {
+      if (!activeSend) return;
+      if (activeSend.kind === 'checkpoint') {
+        if (checkpointJob) checkpointJob.phase = 'waiting';
+      } else {
+        const item = scheduledItems.find(entry => entry.id === activeSend.itemId);
+        if (item) item.state = 'waiting';
+      }
+      persistState();
+    }
+
+    function clickActiveSend(context, timestamp, { retry = false } = {}) {
+      if (!activeSend) return false;
       const composer = context?.composer;
       const sendButton = context?.sendButton;
-      if (!job || !composer || !isSendReady(sendButton) || sendButton?.isConnected === false) return false;
-
+      if (!composer || !isSendReady(sendButton) || sendButton?.isConnected === false) return false;
       const currentNormalized = normalizeText(readText(composer));
-      if (currentNormalized !== job.expectedNormalized) return false;
+      if (!currentNormalized || currentNormalized !== activeSend.expectedNormalized) return false;
 
-      job.phase = 'confirm';
-      job.clickCount += 1;
-      job.clickedAt ||= timestamp;
-      job.lastClickAt = timestamp;
-      job.clickedComposer = composer;
-      job.clickedButton = sendButton;
-      clearPersistedJob(); // Never restore a click-in-flight after a reload: that could duplicate a send.
+      activeSend.phase = 'confirm';
+      activeSend.clickCount += 1;
+      activeSend.clickedAt ||= timestamp;
+      activeSend.lastClickAt = timestamp;
+      activeSend.clickedComposer = composer;
+      activeSend.clickedButton = sendButton;
+      markTargetClickInFlight();
       emitChange();
 
       console.info(
-        `[ChatGPT notifier] Нажимаю штатный Send по таймеру${retry ? ` повторно (${job.clickCount}/${SEND_MAX_CLICKS})` : ''}.`
+        `[ChatGPT notifier] Нажимаю штатный Send для ${activeSend.kind === 'checkpoint' ? 'чекпоинта' : 'отложенного сообщения'}` +
+        `${retry ? ` повторно (${activeSend.clickCount}/${SEND_MAX_CLICKS})` : ''}.`
       );
       try {
         sendButton.click();
       } catch (error) {
         console.warn('[ChatGPT notifier] Ошибка штатного Send по таймеру:', error);
+        activeSend.phase = 'prepare';
+        restoreTargetAfterClickFailure();
         return false;
       }
       return true;
     }
 
-    function check(timestamp = now()) {
+    function finishActiveSend(reason) {
+      const job = activeSend;
       if (!job) return false;
-      if (String(getRouteKey() || '') !== job.routeKey) {
-        return cancel('Отложенная отправка снята: открыт другой чат.');
+      if (job.kind === 'checkpoint') {
+        checkpointJob = null;
+        lastStatus = 'Чекпоинт отправлен.';
+      } else {
+        scheduledItems = scheduledItems.filter(item => item.id !== job.itemId);
+        lastStatus = '';
       }
+      activeSend = null;
+      lastRenderSignature = '';
+      persistState();
+      emitChange();
+      console.info(`[ChatGPT notifier] Отложенная отправка подтверждена (${reason}).`);
+      return true;
+    }
 
-      noteRemaining(timestamp);
+    function failActiveSend() {
+      const job = activeSend;
+      if (!job) return false;
+      if (job.kind === 'checkpoint') {
+        checkpointJob = null;
+        lastStatus = 'Не удалось подтвердить отправку чекпоинта; автоматически повторять не буду.';
+      } else {
+        const item = scheduledItems.find(entry => entry.id === job.itemId);
+        if (item) item.state = 'uncertain';
+        lastStatus = 'Одну отложенную отправку не удалось подтвердить. Она помечена «?» и автоматически повторяться не будет.';
+      }
+      activeSend = null;
+      lastRenderSignature = '';
+      persistState();
+      emitChange();
+      return false;
+    }
+
+    function processActiveSend(timestamp) {
+      const job = activeSend;
+      if (!job) return false;
 
       if (job.phase === 'confirm') {
         const clickedComposer = job.clickedComposer;
@@ -2083,69 +2238,169 @@
           clickedComposerConnected,
           clickedComposerHasText
         });
-        if (confirmation.confirmed) return finishConfirmed(confirmation.reason);
+        if (confirmation.confirmed) return finishActiveSend(confirmation.reason);
 
-        if (timestamp - job.clickedAt >= SEND_CONFIRM_TIMEOUT_MS) {
-          return fail('Не удалось подтвердить отправку по таймеру; повторной отправки не будет.');
-        }
-
+        if (timestamp - job.clickedAt >= SEND_CONFIRM_TIMEOUT_MS) return failActiveSend();
         if (timestamp - job.lastClickAt < SEND_RETRY_DELAY_MS || job.clickCount >= SEND_MAX_CLICKS) return false;
+        if (currentGenerationActive() || currentPipelineBusy()) return false;
+
         const context = resolveContext();
         const currentNormalized = normalizeText(readText(context?.composer));
         if (!context?.composer || currentNormalized !== job.expectedNormalized || !isSendReady(context.sendButton)) return false;
-        return clickWithContext(context, timestamp, { retry: true });
+        return clickActiveSend(context, timestamp, { retry: true });
       }
 
+      if (currentGenerationActive() || currentPipelineBusy()) return false;
       const context = resolveContext();
-      if (context?.composer) {
-        const currentNormalized = normalizeText(readText(context.composer));
-        if (currentNormalized !== job.expectedNormalized) {
-          if (!job.mismatchSince) job.mismatchSince = timestamp;
-          if (timestamp - job.mismatchSince >= TEXT_MISMATCH_GRACE_MS) {
-            return cancel('Отложенная отправка снята: текст в поле ChatGPT изменился.');
-          }
-          return false;
-        }
-        job.mismatchSince = 0;
+      const composer = context?.composer;
+      if (!composer) return false;
+
+      const currentNormalized = normalizeText(readText(composer));
+      if (!job.insertedByScript) {
+        if (currentNormalized) return false; // Never overwrite unrelated user text.
+        if (!setText(composer, job.text)) return false;
+        job.insertedByScript = true;
+        emitChange();
+        return false;
       }
 
-      if (timestamp < job.deadline) return false;
-      if (currentGenerationActive()) return false;
-      if (!context?.composer || !isSendReady(context.sendButton)) return false;
+      if (currentNormalized !== job.expectedNormalized) {
+        // The native editor can be replaced or edited after our insertion. Never
+        // overwrite the differing text; release ownership and wait for an empty
+        // composer before inserting the stored message again.
+        job.insertedByScript = false;
+        return false;
+      }
+      if (!isSendReady(context.sendButton)) return false;
+      return clickActiveSend(context, timestamp);
+    }
 
-      return clickWithContext(context, timestamp);
+    function dueCandidate(timestamp) {
+      const candidates = [];
+      if (checkpointJob?.phase === 'waiting' && checkpointJob.deadline <= timestamp) {
+        candidates.push({ kind: 'checkpoint', deadline: checkpointJob.deadline, text: checkpointJob.text, expectedNormalized: checkpointJob.expectedNormalized });
+      }
+      for (const item of scheduledItems) {
+        if (item.state !== 'waiting' || item.deadline > timestamp) continue;
+        candidates.push({ kind: 'scheduled', itemId: item.id, deadline: item.deadline, text: item.text, expectedNormalized: item.expectedNormalized });
+      }
+      candidates.sort((a, b) => a.deadline - b.deadline);
+      return candidates[0] || null;
+    }
+
+    function startCandidate(candidate, timestamp) {
+      activeSend = {
+        ...candidate,
+        phase: 'prepare',
+        startedAt: timestamp,
+        clickedAt: 0,
+        lastClickAt: 0,
+        clickCount: 0,
+        insertedByScript: false,
+        clickedComposer: null,
+        clickedButton: null
+      };
+      emitChange();
+      return processActiveSend(timestamp);
+    }
+
+    function noteRemaining(timestamp) {
+      const checkpointSecond = checkpointJob?.phase === 'waiting'
+        ? Math.max(0, Math.ceil((checkpointJob.deadline - timestamp) / 1000))
+        : -1;
+      const itemSignature = scheduledItems
+        .map(item => `${item.id}:${item.state}:${item.state === 'waiting' ? Math.max(0, Math.ceil((item.deadline - timestamp) / 1000)) : -1}`)
+        .join('|');
+      const signature = `${checkpointSecond}::${itemSignature}::${activeSend?.kind || ''}:${activeSend?.itemId || ''}:${activeSend?.phase || ''}`;
+      if (signature === lastRenderSignature) return;
+      lastRenderSignature = signature;
+      emitChange();
+    }
+
+    function check(timestamp = now()) {
+      const routeKey = currentRouteKey();
+      if ((checkpointJob && checkpointJob.routeKey !== routeKey) || scheduledItems.some(item => item.routeKey !== routeKey)) {
+        return resetForNavigation();
+      }
+
+      noteRemaining(timestamp);
+      if (activeSend) return processActiveSend(timestamp);
+      const candidate = dueCandidate(timestamp);
+      if (!candidate) return false;
+      return startCandidate(candidate, timestamp);
     }
 
     function resetForNavigation() {
-      if (job) clearJob({ status: '', persist: true });
-      else clearPersistedJob();
+      checkpointJob = null;
+      scheduledItems = [];
+      activeSend = null;
+      lastStatus = '';
+      lastRenderSignature = '';
+      storageRemove(STATE_KEY);
+      emitChange();
+      return true;
     }
 
-    function getRemainingMs(timestamp = now()) {
-      if (!job) return 0;
-      return Math.max(0, job.deadline - timestamp);
+    function getCheckpointRemainingMs(timestamp = now()) {
+      if (!checkpointJob) return 0;
+      return Math.max(0, checkpointJob.deadline - timestamp);
     }
 
-    function getRemainingLabel(timestamp = now()) {
-      return job ? formatDelayedRemaining(getRemainingMs(timestamp)) : '';
+    function getCheckpointRemainingLabel(timestamp = now()) {
+      return checkpointJob ? formatDelayedRemaining(getCheckpointRemainingMs(timestamp)) : '';
+    }
+
+    function getScheduledItems(timestamp = now()) {
+      return scheduledItems.map(item => ({
+        id: item.id,
+        text: item.text,
+        deadline: item.deadline,
+        state: item.state,
+        createdAt: item.createdAt,
+        remainingMs: item.state === 'waiting' ? Math.max(0, item.deadline - timestamp) : 0,
+        remainingLabel: item.state === 'waiting' ? formatDelayedRemaining(Math.max(0, item.deadline - timestamp)) : '?'
+      }));
+    }
+
+    function hasDueWork(timestamp = now()) {
+      return Boolean(dueCandidate(timestamp));
     }
 
     loadPersistedState();
 
     return {
-      arm,
-      toggle,
-      cancel,
+      setDelayMs,
+      setDelayMinutes,
+      getDelayMs: () => delayMs,
+      getDelayMinutes: () => formatDelayMinutes(delayMs),
+      setCheckpointText,
+      getCheckpointText: () => checkpointText,
+      armCheckpoint,
+      cancelCheckpoint,
+      toggleCheckpoint,
+      addScheduled,
+      removeScheduled,
+      getScheduledItems,
+      getScheduledCount: () => scheduledItems.length,
+      hasDueWork,
       check,
       resetForNavigation,
-      setDelayMs,
-      getDelayMs: () => delayMs,
-      getRemainingMs,
-      getRemainingLabel,
-      getDeadline: () => job?.deadline || 0,
+      getCheckpointRemainingMs,
+      getCheckpointRemainingLabel,
+      getCheckpointDeadline: () => checkpointJob?.deadline || 0,
       getLastStatus: () => lastStatus,
-      isActive: () => Boolean(job),
-      isConfirmingSend: () => job?.phase === 'confirm'
+      clearStatus,
+      isCheckpointActive: () => Boolean(checkpointJob),
+      isSending: () => Boolean(activeSend),
+      isConfirmingSend: () => activeSend?.phase === 'confirm',
+      // Compatibility aliases for older callers/tests.
+      arm: armCheckpoint,
+      toggle: toggleCheckpoint,
+      cancel: cancelCheckpoint,
+      getRemainingMs: getCheckpointRemainingMs,
+      getRemainingLabel: getCheckpointRemainingLabel,
+      getDeadline: () => checkpointJob?.deadline || 0,
+      isActive: () => Boolean(checkpointJob)
     };
   }
 
@@ -2154,6 +2409,8 @@
     MIN_DELAY_MS,
     MAX_DELAY_MS,
     normalizeDelayMs,
+    delayMinutesToMs,
+    formatDelayMinutes,
     formatDelayedRemaining,
     evaluateDelayedSendConfirmation,
     createDelayedSendController
@@ -2379,6 +2636,45 @@
           : `ChatGPT notifier v${deps.SCRIPT_VERSION} · Открыть очередь сообщений`;
     }
 
+    function renderDelayedList(ui) {
+      const items = delayedSendController?.getScheduledItems?.() || [];
+      ui.delayedList.replaceChildren();
+
+      items.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'delayed-item';
+        row.dataset.state = item.state || 'waiting';
+
+        const number = document.createElement('span');
+        number.className = 'number';
+        number.textContent = String(index + 1);
+
+        const text = document.createElement('span');
+        text.className = 'queue-text';
+        text.textContent = item.text;
+        text.title = item.text;
+
+        const time = document.createElement('span');
+        time.className = 'delayed-time';
+        time.textContent = item.state === 'uncertain' ? '?' : item.remainingLabel;
+        time.title = item.state === 'uncertain'
+          ? 'Отправка была начата, но результат не удалось надёжно подтвердить. Автоповтора нет.'
+          : `Осталось: ${item.remainingLabel}`;
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'item-action remove';
+        remove.textContent = '×';
+        remove.title = 'Удалить из отложенных';
+        remove.addEventListener('click', () => delayedSendController?.removeScheduled?.(item.id));
+
+        row.append(number, text, time, remove);
+        ui.delayedList.appendChild(row);
+      });
+
+      ui.delayedSection.style.display = items.length ? 'block' : 'none';
+    }
+
     function ensureUi() {
       let host = document.getElementById(deps.UPLOAD_HOST_ID);
       if (host?.shadowRoot?.querySelector('[data-role="delay-send"]')) {
@@ -2396,9 +2692,14 @@
           status: host.shadowRoot.querySelector('.status'),
           timerStatus: host.shadowRoot.querySelector('.timer-status'),
           delaySelect: host.shadowRoot.querySelector('.delay-select'),
+          delayMinutes: host.shadowRoot.querySelector('.delay-minutes'),
+          checkpointInput: host.shadowRoot.querySelector('.checkpoint-input'),
+          delayedSection: host.shadowRoot.querySelector('.delayed-section'),
+          delayedList: host.shadowRoot.querySelector('.delayed-list'),
           sendAll: host.shadowRoot.querySelector('.send-all'),
-          textarea: host.shadowRoot.querySelector('textarea'),
+          textarea: host.shadowRoot.querySelector('.queue-input'),
           add: host.shadowRoot.querySelector('.add'),
+          scheduleLater: host.shadowRoot.querySelector('.schedule-later'),
           fromChat: host.shadowRoot.querySelector('.from-chat'),
           versionChip: host.shadowRoot.querySelector('.version-chip'),
           panelVersion: host.shadowRoot.querySelector('.panel-version')
@@ -2515,22 +2816,45 @@
             margin-left:auto; min-width:106px; padding:5px 7px; border:1px solid rgba(128,128,128,.28); border-radius:7px;
             background:rgba(30,30,30,.98); color:#eee; font:11px/1.2 system-ui,sans-serif; outline:none;
           }
+          .delay-manual-row { display:flex; align-items:center; gap:7px; margin-top:7px; }
+          .delay-manual-label { color:rgba(255,255,255,.50); font:10px/1.2 system-ui,sans-serif; }
+          .delay-minutes {
+            width:76px; margin-left:auto; padding:5px 7px; border:1px solid rgba(128,128,128,.28); border-radius:7px;
+            background:rgba(30,30,30,.98); color:#eee; font:11px/1.2 system-ui,sans-serif; outline:none;
+          }
+          .delay-unit { color:rgba(255,255,255,.46); font:10px/1 system-ui,sans-serif; }
           .delay-note { margin-top:5px; color:rgba(255,255,255,.34); font:10px/1.25 system-ui,sans-serif; }
-          .timer-status { display:none; margin-top:6px; color:rgba(255,255,255,.58); font:10px/1.3 system-ui,sans-serif; }
-          .composer { padding:9px; border:1px solid rgba(128,128,128,.28); border-radius:14px; background:rgba(30,30,30,.98); box-shadow:0 12px 34px rgba(0,0,0,.34); }
+          .checkpoint-label { margin-top:8px; color:rgba(255,255,255,.62); font:600 10px/1.2 system-ui,sans-serif; }
           textarea { display:block; width:100%; min-height:66px; max-height:190px; resize:vertical; padding:4px 4px 7px; border:0; outline:none; background:transparent; color:#fff; font:13px/1.42 system-ui,sans-serif; }
           textarea::placeholder { color:rgba(255,255,255,.36); }
-          .composer-bottom { display:flex; align-items:center; gap:7px; }
-          .actions-left { display:flex; align-items:center; gap:7px; min-width:0; }
+          .checkpoint-input {
+            min-height:52px; max-height:120px; margin-top:5px; padding:7px 8px; border:1px solid rgba(128,128,128,.24);
+            border-radius:8px; background:rgba(30,30,30,.72); font-size:11px;
+          }
+          .timer-status { display:none; margin-top:6px; color:rgba(255,255,255,.58); font:10px/1.3 system-ui,sans-serif; }
+          .delayed-section { display:none; margin:0 0 7px; }
+          .section-title { margin:0 0 5px; color:rgba(255,255,255,.54); font:600 10px/1.2 system-ui,sans-serif; }
+          .delayed-list { max-height:150px; overflow-y:auto; scrollbar-width:thin; }
+          .delayed-item {
+            display:flex; align-items:center; gap:7px; min-height:38px; margin-bottom:5px; padding:6px 8px;
+            border:1px solid rgba(128,128,128,.24); border-radius:10px; background:rgba(43,43,43,.98);
+          }
+          .delayed-item[data-state="uncertain"] { border-color:rgba(202,153,58,.62); }
+          .delayed-time { flex:0 0 auto; color:rgba(255,255,255,.62); font:600 10px/1 system-ui,sans-serif; }
+          .composer { padding:9px; border:1px solid rgba(128,128,128,.28); border-radius:14px; background:rgba(30,30,30,.98); box-shadow:0 12px 34px rgba(0,0,0,.34); }
+          .composer-bottom { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+          .actions-left { display:flex; align-items:center; gap:7px; min-width:0; flex-wrap:wrap; }
           .hint { margin-left:auto; color:rgba(255,255,255,.32); font:10px/1 system-ui,sans-serif; white-space:nowrap; }
-          .add,.from-chat {
+          .add,.schedule-later,.from-chat {
             border:1px solid rgba(128,128,128,.28); border-radius:8px; padding:7px 11px; cursor:pointer;
             background:rgba(48,48,48,.98); color:#eee; font:600 12px/1 system-ui,sans-serif; white-space:nowrap;
           }
-          .add:hover,.from-chat:hover { background:rgba(64,64,64,.98); color:#fff; }
+          .add:hover,.schedule-later:hover,.from-chat:hover { background:rgba(64,64,64,.98); color:#fff; }
+          .schedule-later { background:rgba(48,58,78,.98); border-color:rgba(100,149,237,.34); }
+          .schedule-later:hover { background:rgba(59,73,101,.98); }
           .from-chat { background:rgba(53,51,74,.98); border-color:rgba(109,93,252,.38); }
           .from-chat:hover { background:rgba(72,68,101,.98); }
-          .add:disabled,.from-chat:disabled { opacity:.48; cursor:default; }
+          .add:disabled,.schedule-later:disabled,.from-chat:disabled { opacity:.48; cursor:default; }
           .status { display:none; margin:0 0 7px; padding:7px 9px; border-radius:9px; background:rgba(127,45,45,.38); color:#ffd7d7; font:11px/1.35 system-ui,sans-serif; }
         </style>
 
@@ -2542,7 +2866,7 @@
           <button type="button" class="send-all">Отправить всё одним сообщением</button>
           <div class="delay-settings">
             <div class="delay-settings-row">
-              <span class="delay-settings-title">Отложенная отправка</span>
+              <span class="delay-settings-title">Задержка</span>
               <select class="delay-select" aria-label="Время отложенной отправки">
                 <option value="30000">30 сек</option>
                 <option value="60000">1 мин</option>
@@ -2552,16 +2876,29 @@
                 <option value="900000">15 мин</option>
                 <option value="1800000">30 мин</option>
                 <option value="3600000">1 час</option>
+                <option value="custom">Своё время</option>
               </select>
             </div>
-            <div class="delay-note">◷ отправляет текущий текст. Спящая вкладка отправит сразу после пробуждения.</div>
+            <div class="delay-manual-row">
+              <span class="delay-manual-label">Свои минуты</span>
+              <input class="delay-minutes" type="text" inputmode="decimal" autocomplete="off" aria-label="Своё количество минут">
+              <span class="delay-unit">мин</span>
+            </div>
+            <div class="delay-note">Эта задержка используется и для чекпоинта ◷, и для кнопки «Отправить позже». Спящая вкладка догонит просроченное после пробуждения.</div>
+            <div class="checkpoint-label">Фиксированный текст чекпоинта для ◷</div>
+            <textarea class="checkpoint-input" placeholder="Например: Проверь текущий прогресс и продолжай с последнего чекпоинта..."></textarea>
             <div class="timer-status"></div>
           </div>
+          <div class="delayed-section">
+            <div class="section-title">Отправятся позже</div>
+            <div class="delayed-list"></div>
+          </div>
           <div class="composer">
-            <textarea placeholder="Добавить следующее сообщение..."></textarea>
+            <textarea class="queue-input" placeholder="Добавить следующее сообщение..."></textarea>
             <div class="composer-bottom">
               <div class="actions-left">
                 <button type="button" class="add">В очередь</button>
+                <button type="button" class="schedule-later">Отправить позже</button>
                 <button type="button" class="from-chat" title="Перенести весь текст из обычного поля ChatGPT в очередь">Из чата → очередь</button>
               </div>
               <span class="hint">Ctrl/⌘ + Enter</span>
@@ -2572,7 +2909,7 @@
         <div class="row" aria-label="ChatGPT notifier controls">
           <span class="meta-chip timer-chip"></span>
           <span class="meta-chip version-chip"></span>
-          <button type="button" class="control" data-role="delay-send" aria-label="Отложенная отправка текущего текста">◷</button>
+          <button type="button" class="control" data-role="delay-send" aria-label="Чекпоинт по таймеру">◷</button>
           <button type="button" class="control" data-role="queue" aria-label="Очередь сообщений">+</button>
           <button type="button" class="control" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
           <span class="badge"></span>
@@ -2592,9 +2929,14 @@
         status: shadow.querySelector('.status'),
         timerStatus: shadow.querySelector('.timer-status'),
         delaySelect: shadow.querySelector('.delay-select'),
+        delayMinutes: shadow.querySelector('.delay-minutes'),
+        checkpointInput: shadow.querySelector('.checkpoint-input'),
+        delayedSection: shadow.querySelector('.delayed-section'),
+        delayedList: shadow.querySelector('.delayed-list'),
         sendAll: shadow.querySelector('.send-all'),
-        textarea: shadow.querySelector('textarea'),
+        textarea: shadow.querySelector('.queue-input'),
         add: shadow.querySelector('.add'),
+        scheduleLater: shadow.querySelector('.schedule-later'),
         fromChat: shadow.querySelector('.from-chat'),
         versionChip: shadow.querySelector('.version-chip'),
         panelVersion: shadow.querySelector('.panel-version')
@@ -2606,6 +2948,14 @@
       function addCurrent() {
         if (!queuedPromptController) return;
         const id = queuedPromptController.add(ui.textarea.value);
+        if (!id) return;
+        ui.textarea.value = '';
+        render();
+        setTimeout(() => ui.textarea.focus(), 0);
+      }
+
+      function scheduleCurrent() {
+        const id = delayedSendController?.addScheduled?.(ui.textarea.value);
         if (!id) return;
         ui.textarea.value = '';
         render();
@@ -2673,7 +3023,11 @@
         if (clickWasDrag(event)) return;
         event.preventDefault();
         event.stopPropagation();
-        delayedSendController?.toggle();
+        delayedSendController?.toggleCheckpoint?.();
+        // The general UI scheduler is intentionally debounced for DOM churn, but
+        // this control needs immediate visual feedback. Without this render a fast
+        // second click can cancel the timer before the active state/chip ever appears.
+        render();
       });
 
       ui.autoButton.addEventListener('click', event => {
@@ -2684,10 +3038,35 @@
       });
 
       ui.delaySelect.addEventListener('change', () => {
+        if (ui.delaySelect.value === 'custom') {
+          ui.delayMinutes.focus();
+          ui.delayMinutes.select?.();
+          return;
+        }
         delayedSendController?.setDelayMs(Number(ui.delaySelect.value));
+        render();
+      });
+
+      function applyManualDelay() {
+        const result = delayedSendController?.setDelayMinutes?.(ui.delayMinutes.value);
+        if (result !== false) render();
+      }
+
+      ui.delayMinutes.addEventListener('change', applyManualDelay);
+      ui.delayMinutes.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        applyManualDelay();
+        ui.delayMinutes.blur();
+      });
+
+      ui.checkpointInput.value = delayedSendController?.getCheckpointText?.() || '';
+      ui.checkpointInput.addEventListener('input', () => {
+        delayedSendController?.setCheckpointText?.(ui.checkpointInput.value);
       });
 
       ui.add.addEventListener('click', addCurrent);
+      ui.scheduleLater.addEventListener('click', scheduleCurrent);
       ui.fromChat.addEventListener('click', () => queuedPromptController?.addFromComposer());
       ui.sendAll.addEventListener('click', () => queuedPromptController?.sendAllNow());
       ui.textarea.addEventListener('keydown', event => {
@@ -2724,17 +3103,27 @@
         ? 'Жду окончания загрузки файлов и затем автоматически отправлю. Нажать ещё раз — отменить.'
         : 'Когда файлы загружаются: нажать, чтобы после завершения автоматически отправить сообщение';
 
-      const delayActive = Boolean(delayedSendController?.isActive());
-      const remainingLabel = delayActive ? delayedSendController.getRemainingLabel() : '';
+      const delayActive = Boolean(delayedSendController?.isCheckpointActive?.());
+      const remainingLabel = delayActive ? delayedSendController.getCheckpointRemainingLabel() : '';
       ui.delayButton.dataset.active = String(delayActive);
       ui.delayButton.setAttribute('aria-pressed', String(delayActive));
       ui.delayButton.title = delayActive
-        ? `Отложенная отправка через ${remainingLabel}. Нажать — снять таймер.`
-        : 'Поставить таймер на отправку текущего текста ChatGPT';
+        ? `Чекпоинт через ${remainingLabel}. Нажать — снять таймер.`
+        : 'Поставить таймер на фиксированный текст чекпоинта';
       ui.timerChip.textContent = remainingLabel;
       ui.timerChip.style.display = delayActive ? 'inline-flex' : 'none';
       const selectedDelay = String(delayedSendController?.getDelayMs?.() || 300000);
-      if (ui.delaySelect.value !== selectedDelay) ui.delaySelect.value = selectedDelay;
+      const hasPreset = Array.from(ui.delaySelect.options).some(option => option.value === selectedDelay);
+      const selectValue = hasPreset ? selectedDelay : 'custom';
+      if (ui.delaySelect.value !== selectValue) ui.delaySelect.value = selectValue;
+      const manualMinutes = delayedSendController?.getDelayMinutes?.() || '5';
+      if (document.activeElement !== ui.delayMinutes && ui.delayMinutes.value !== String(manualMinutes)) {
+        ui.delayMinutes.value = String(manualMinutes);
+      }
+      const checkpointText = delayedSendController?.getCheckpointText?.() || '';
+      if (document.activeElement !== ui.checkpointInput && ui.checkpointInput.value !== checkpointText) {
+        ui.checkpointInput.value = checkpointText;
+      }
       const timerStatus = delayedSendController?.getLastStatus?.() || '';
       ui.timerStatus.textContent = timerStatus;
       ui.timerStatus.style.display = timerStatus ? 'block' : 'none';
@@ -2742,6 +3131,7 @@
       ui.versionChip.textContent = `v${deps.SCRIPT_VERSION}`;
       ui.panelVersion.textContent = `v${deps.SCRIPT_VERSION}`;
       renderQueueList(ui);
+      renderDelayedList(ui);
       positionPanel(host, ui.panel);
     }
 
@@ -2954,12 +3344,21 @@
           uploadController?.reset({ clearMark: true, render: false, clearFileHistory: true });
         }
       },
-      onFinished: () => queuedPromptController?.handleResponseFinished()
+      onFinished: () => {
+        delayedSendController?.check();
+        if (!delayedSendController?.isSending?.() && !delayedSendController?.hasDueWork?.()) {
+          queuedPromptController?.handleResponseFinished();
+        }
+      }
     });
 
     uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
     queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
-    delayedSendController = deps.createDelayedSendController({ onChange: scheduleUi, isGenerationActive: deps.isGenerating });
+    delayedSendController = deps.createDelayedSendController({
+      onChange: scheduleUi,
+      isGenerationActive: deps.isGenerating,
+      isSendPipelineBusy: () => Boolean(queuedPromptController?.isWaitingToSend() || uploadController?.isConfirmingSend())
+    });
     uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController });
     let lastUrl = location.href;
 
@@ -2999,9 +3398,6 @@
     document.addEventListener('click', event => {
       if (!deps.isComposerSendButton(event.target)) return;
       responseMonitor.armAnswer('send-button');
-      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
-        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
-      }
     }, true);
 
     document.addEventListener('keydown', event => {
@@ -3010,9 +3406,6 @@
         !event.altKey && !event.metaKey && deps.isComposerTarget(event.target)
       ) {
         responseMonitor.armAnswer('enter-key');
-        if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
-          delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
-        }
       }
     }, true);
 
@@ -3020,9 +3413,6 @@
       if (typeof HTMLFormElement === 'undefined' || !(event.target instanceof HTMLFormElement)) return;
       if (!deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) return;
       responseMonitor.armAnswer('form-submit');
-      if (delayedSendController?.isActive() && !delayedSendController.isConfirmingSend()) {
-        delayedSendController.cancel('Отложенная отправка снята: сообщение отправлено вручную.');
-      }
     }, true);
 
     function markViewed() {
@@ -3082,15 +3472,15 @@
       if (location.href !== lastUrl) resetForNavigation();
       responseMonitor.check();
       uploadController.check();
-      queuedPromptController.attemptSend();
       delayedSendController?.check();
+      queuedPromptController.attemptSend();
       tickCount += 1;
       if (!document.hidden && tickCount % 6 === 0) scheduleUi();
     }, deps.SETTINGS.checkIntervalMs);
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand(`ℹ Версия: v${deps.SCRIPT_VERSION}`, () => console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION}`));
-      GM_registerMenuCommand('◷ Отложенная отправка текущего текста', delayedSendController.toggle);
+      GM_registerMenuCommand('◷ Чекпоинт по таймеру', delayedSendController.toggleCheckpoint);
       GM_registerMenuCommand('⇧ Автоотправка после загрузки файлов', uploadController.toggle);
       GM_registerMenuCommand('● Проверить уведомление', notifications.showDesktopNotification);
     }
@@ -3098,7 +3488,7 @@
     tabState.render();
     responseMonitor.check();
     scheduleUi();
-    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — отложенная отправка, + — очередь, ⇧ — автоотправка файлов.`);
+    console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — чекпоинт по таймеру, + — очередь/отложенные, ⇧ — автоотправка файлов.`);
 
     return {
       dispose() {
