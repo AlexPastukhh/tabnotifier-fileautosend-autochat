@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const {
@@ -8,6 +9,7 @@ const {
   delayMinutesToMs,
   formatDelayMinutes,
   formatDelayedRemaining,
+  evaluateCheckpointResponseGuard,
   evaluateDelayedSendConfirmation,
   createDelayedSendController
 } = require('../src/delayed-send.js');
@@ -26,6 +28,7 @@ function createHarness({ storage = createMemoryStorage() } = {}) {
   let route = 'https://chatgpt.com/c/test';
   let generating = false;
   let pipelineBusy = false;
+  let assistantSnapshot = { count: 0, fingerprint: '0:' };
   let clicks = 0;
   const clickedTexts = [];
   const composer = { isConnected: true, text: '' };
@@ -43,6 +46,7 @@ function createHarness({ storage = createMemoryStorage() } = {}) {
     getRouteKey: () => route,
     isGenerationActive: () => generating,
     isSendPipelineBusy: () => pipelineBusy,
+    getAssistantSnapshot: () => ({ ...assistantSnapshot }),
     resolveContext: () => context,
     isSendReady: candidate => candidate === button && candidate.isConnected !== false,
     readText: candidate => candidate?.text || '',
@@ -63,7 +67,14 @@ function createHarness({ storage = createMemoryStorage() } = {}) {
     setTime(value) { time = value; },
     setRoute(value) { route = value; },
     setGenerating(value) { generating = Boolean(value); },
-    setPipelineBusy(value) { pipelineBusy = Boolean(value); }
+    setPipelineBusy(value) { pipelineBusy = Boolean(value); },
+    setAssistantSnapshot(count, text = '') {
+      const numericCount = Math.max(0, Number(count) || 0);
+      const normalizedText = String(text || '').replace(/\s+/g, ' ').trim();
+      assistantSnapshot = numericCount > 0
+        ? { count: numericCount, fingerprint: `${numericCount}:${normalizedText.length}:${normalizedText.slice(-300)}` }
+        : { count: 0, fingerprint: '0:' };
+    }
   };
 }
 
@@ -82,6 +93,35 @@ test('delayed timer formats countdown like a compact version chip', () => {
   assert.equal(formatDelayedRemaining(0), '00:00');
   assert.equal(formatDelayedRemaining(65_000), '01:05');
   assert.equal(formatDelayedRemaining(3_661_000), '1:01:01');
+});
+
+test('checkpoint response guard reuses assistant snapshot semantics and fails closed while hydration is incomplete', () => {
+  assert.deepEqual(
+    evaluateCheckpointResponseGuard({
+      baseline: { count: 2, fingerprint: '2:5:hello' },
+      current: { count: 2, fingerprint: '2:5:hello' }
+    }),
+    { allow: true, answered: false, reason: 'unchanged' }
+  );
+  assert.equal(
+    evaluateCheckpointResponseGuard({
+      baseline: { count: 2, fingerprint: '2:5:hello' },
+      current: { count: 3, fingerprint: '3:6:answer' }
+    }).answered,
+    true
+  );
+  assert.deepEqual(
+    evaluateCheckpointResponseGuard({
+      baseline: { count: 2, fingerprint: '2:5:hello' },
+      current: { count: 1, fingerprint: '1:3:old' }
+    }),
+    { allow: false, answered: false, reason: 'snapshot-not-ready' }
+  );
+});
+
+test('runtime wires the existing response-monitor assistantSnapshot into the checkpoint guard', () => {
+  const source = fs.readFileSync(new URL('../src/runtime.js', import.meta.url), 'utf8');
+  assert.match(source, /getAssistantSnapshot:\s*deps\.assistantSnapshot/);
 });
 
 test('delay bounds reject invalid values and keep a safe default', () => {
@@ -147,6 +187,85 @@ test('checkpoint sends its stored text instead of reading the native ChatGPT com
   h.controller.check();
   assert.equal(h.clicks, 1);
   assert.equal(h.clickedTexts[0], 'fixed checkpoint text');
+});
+
+test('checkpoint is cancelled as soon as an assistant answer appears after arming', () => {
+  const h = createHarness();
+  h.controller.setDelayMs(60_000);
+  armCheckpoint(h, 'should not be sent');
+
+  h.setAssistantSnapshot(1, 'assistant answered');
+  h.setTime(10_000);
+  h.controller.check();
+
+  assert.equal(h.controller.isCheckpointActive(), false);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.composer.text, '');
+  assert.match(h.controller.getLastStatus(), /Ответ ChatGPT уже получен/);
+});
+
+test('checkpoint guard clears its owned composer text if the answer arrives between insertion and Send', () => {
+  const h = createHarness();
+  h.controller.setDelayMs(30_000);
+  armCheckpoint(h, 'checkpoint race');
+
+  h.setTime(31_000);
+  h.controller.check();
+  assert.equal(h.composer.text, 'checkpoint race');
+  assert.equal(h.clicks, 0);
+
+  h.setAssistantSnapshot(1, 'answer completed during the final guard window');
+  h.controller.check();
+  assert.equal(h.clicks, 0);
+  assert.equal(h.composer.text, '');
+  assert.equal(h.controller.isCheckpointActive(), false);
+});
+
+test('persisted checkpoint does not fire after sleep when an answer arrived while JavaScript was suspended', () => {
+  const storage = createMemoryStorage();
+  const first = createHarness({ storage });
+  first.controller.setDelayMs(30_000);
+  armCheckpoint(first, 'sleep guard checkpoint');
+
+  const second = createHarness({ storage });
+  second.setAssistantSnapshot(1, 'answer received while tab slept');
+  second.setTime(90_000);
+  second.controller.check();
+
+  assert.equal(second.clicks, 0);
+  assert.equal(second.composer.text, '');
+  assert.equal(second.controller.isCheckpointActive(), false);
+});
+
+test('checkpoint waits for assistant snapshot hydration after reload instead of sending blindly', () => {
+  const storage = createMemoryStorage();
+  const first = createHarness({ storage });
+  first.setAssistantSnapshot(2, 'previous assistant answer');
+  first.controller.setDelayMs(30_000);
+  armCheckpoint(first, 'wait for hydration');
+
+  const second = createHarness({ storage }); // current DOM snapshot is temporarily 0 messages
+  second.setTime(90_000);
+  second.controller.check();
+  assert.equal(second.clicks, 0);
+  assert.equal(second.composer.text, '');
+  assert.equal(second.controller.isCheckpointActive(), true);
+
+  second.setAssistantSnapshot(2, 'previous assistant answer');
+  second.controller.check();
+  second.controller.check();
+  assert.equal(second.clicks, 1);
+});
+
+test('assistant answers do not cancel ordinary delayed-list messages', () => {
+  const h = createHarness();
+  h.controller.setDelayMs(30_000);
+  h.controller.addScheduled('ordinary delayed message');
+  h.setAssistantSnapshot(1, 'assistant answer unrelated to the delayed list');
+
+  runDueSend(h, 31_000);
+  assert.equal(h.clicks, 1);
+  assert.equal(h.clickedTexts[0], 'ordinary delayed message');
 });
 
 test('absolute checkpoint deadline catches up after a long sleeping-tab pause', () => {
