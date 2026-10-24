@@ -205,3 +205,11 @@ test('local upload is monochrome and cannot masquerade as blue Observatory work'
  const svg=decodeURIComponent(h.icon().href);
  for(const color of Object.values(TASK_PALETTE))assert.ok(!svg.includes(color));
 });
+
+test('reported completion never hides simultaneously observed ChatGPT generation',()=>{
+ const raw=validateTaskOverview(overview({completed:1},1792530000000),1792530000000);
+ const v=resolveTabVisual({bound:true,overview:raw,state:'working',domGenerating:true});
+ assert.equal(v.icon.color,'green');
+ assert.match(v.symbol,/ChatGPT: генерация наблюдается/);
+ assert.equal(cleanTitle(v.symbol+' Natural Chat'), 'Natural Chat');
+});

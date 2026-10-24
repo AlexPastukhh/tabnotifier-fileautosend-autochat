@@ -106,8 +106,8 @@
       request: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null,
       queue: queuedPromptController, messages: persistentMessageController,
       profiles: textboxProfileManager,
-      quickAction: ({mode,text,moduleIds,profileId})=>
-        uploadUi?.dispatchQuickAction?.(mode,text,moduleIds,profileId) || {ok:false},
+      quickAction: ({mode,text,moduleIds,profileId,delayMs})=>
+        uploadUi?.dispatchQuickAction?.(mode,text,moduleIds,profileId,delayMs) || {ok:false},
       findComposerContext: deps.findComposerContext,
       isGenerating: deps.isGenerating,
       canExecute: context => !uploadController.isArmed() &&

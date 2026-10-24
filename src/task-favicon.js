@@ -104,6 +104,8 @@
     if (!icon && domKind) icon = { source: 'dom', color: null, kind: domKind, pending: false, unread };
     const markers = [marker, domMarker];
     if (unread) markers.push('●');
+    if (domActive && bound && overview?.primary_state === 'completed')
+      markers.push('[ChatGPT: генерация наблюдается]');
     if (uncertain) {
       const reason = overview?.incomplete === true ? 'неполная сводка' : ({
         checking: 'проверка', denied: 'нет доступа', stale: 'статус устарел', unsupported: 'старый API'

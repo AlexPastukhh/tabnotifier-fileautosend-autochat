@@ -45,7 +45,7 @@
           break;
         }
       }
-      const withoutConnection = value.replace(/^\[Observatory: (?:нет связи|нет доступа|статус устарел|старый API|проверка|неполная сводка)\]\s*/, '');
+      const withoutConnection = value.replace(/^\[(?:Observatory: (?:нет связи|нет доступа|статус устарел|старый API|проверка|неполная сводка)|ChatGPT: генерация наблюдается)\]\s*/, '');
       if (withoutConnection !== value) { value = withoutConnection; removed = true; }
     }
     return value.trim();

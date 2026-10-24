@@ -26,8 +26,8 @@ test('Notifier startup constructs upload UI with addressable dispatcher without 
   assert.equal(typeof ui.dispatchQuickAction,'function');
   assert.deepEqual(await ui.dispatchQuickAction('invalid','','not-array'),{ok:false});
   const implementation = source();
-  assert.match(implementation,/async function dispatchQuickAction\(mode,text,moduleIds=null,profileId=null\)/);
-  assert.match(implementation,/dispatchQuickAction[\s\S]*?ensureUi\(\);[\s\S]*?return handleQuickDispatch\(mode,text,moduleIds,profileId\)/,
+  assert.match(implementation,/async function dispatchQuickAction\(mode,text,moduleIds=null,profileId=null,delayMs=1000\)/);
+  assert.match(implementation,/dispatchQuickAction[\s\S]*?ensureUi\(\);[\s\S]*?return handleQuickDispatch\(mode,text,moduleIds,profileId,delayMs\)/,
     'public method must call the populated UI dispatcher, not retain an old noop');
   assert.match(implementation,/handleQuickDispatch = async function executeQuickDispatch\(/,
     'File, Insert and Send handlers must actually populate exported dispatcher');
@@ -77,12 +77,13 @@ test('right-hand textbox is always visible and does not replace the old three bu
   assert.match(text, /!canStartFloatingDrag\(event\.target\)/);
 });
 
-test('quick textbox uses the existing safe persistent send; queue and delayed buttons keep handlers', () => {
+test('quick textbox uses explicit prepared Send; old queue and delayed buttons keep handlers', () => {
   const text = source();
   assert.match(text, /function sendQuickCurrent\(originalOverride = null, moduleIds = null, profileId = null\)[\s\S]*?persistentMessageController\?\.saveAndSend\(originalText,options\)/);
   assert.match(text, /originalOverride === null[\s\S]*?largePaste\.text\(ui\.quickInput\.value\)/);
-  assert.match(text, /ui\.quickSend\.addEventListener\('click', \(\)=>sendQuickCurrent\(\)\)/);
-  assert.match(text, /ui\.quickInput\.addEventListener\('keydown',[\s\S]*?shouldSendQuickTextboxKey\(event\)/);
+  assert.match(text, /ui\.quickSend\.addEventListener\('click',\(\)=>\{/);
+  assert.match(text, /const result=sendPreparedNative\(\)/);
+  assert.doesNotMatch(text, /ui\.quickInput\.addEventListener\('keydown',[\s\S]*?sendQuickCurrent\(\)/);
   assert.match(text, /if \(!id\) return \{ok:false\};[\s\S]*?ui\.quickInput\.value = ''/);
   assert.match(text, /ui\.queueButton\.addEventListener\('click'/);
   assert.match(text, /ui\.delayButton\.addEventListener\('click'/);

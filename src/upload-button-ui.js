@@ -378,14 +378,14 @@
     // Do not export an uninitialised inner handler (startup ReferenceError),
     // or snapshot a noop before ensureUi() (silent owner dispatch failures).
     let handleQuickDispatch = null;
-    async function dispatchQuickAction(mode,text,moduleIds=null,profileId=null) {
+    async function dispatchQuickAction(mode,text,moduleIds=null,profileId=null,delayMs=1000) {
       if(!['file','insert','send','send_prepared'].includes(mode)||
          typeof text!=='string'||(mode!=='send_prepared'&&!text.trim())||
          (moduleIds!==null&&(!Array.isArray(moduleIds)||
             moduleIds.some(id=>typeof id!=='string'))))return {ok:false};
       ensureUi();
       if (typeof handleQuickDispatch !== 'function')return {ok:false};
-      return handleQuickDispatch(mode,text,moduleIds,profileId);
+      return handleQuickDispatch(mode,text,moduleIds,profileId,delayMs);
     }
 
     function viewportSize() {
@@ -663,6 +663,41 @@
         label.textContent = status + ' · ' + record.task_id + ' · '
           + record.original_text.slice(0, 85);
         row.appendChild(label);
+        const full=document.createElement('button');full.type='button';full.textContent='Просмотреть';
+        full.addEventListener('click',()=>{
+          const existing=row.querySelector('.saved-original');
+          if(existing){existing.remove();return;}
+          const area=document.createElement('textarea');area.className='saved-original';
+          area.readOnly=true;area.value=record.original_text;area.rows=7;
+          area.setAttribute('aria-label','Сохранённый полный оригинал');row.append(area);
+        });
+        row.append(full);
+        const restore=document.createElement('button');restore.type='button';
+        restore.textContent='Восстановить';
+        restore.addEventListener('click',()=>{
+          if(ui.quickInput.value.trim()||largePaste.active()){
+            ui.persistedStatus.textContent='Сначала освободите текстбокс: текущий текст не заменён.';return;
+          }
+          const original=String(record.original_text||'');
+          if(largePaste.capture(original)){
+            ui.quickInput.value=largePaste.preview();ui.quickInput.readOnly=true;
+            ui.quickCopy.hidden=false;ui.quickClear.hidden=false;ui.quickExpand.hidden=false;
+          }else{ui.quickInput.readOnly=false;ui.quickInput.value=original;}
+          ui.persistedStatus.textContent='Исходник восстановлен без Send; для нового запроса подготовьте его заново.';
+        });row.append(restore);
+        const copy=document.createElement('button');copy.type='button';copy.textContent='Копировать';
+        copy.addEventListener('click',async()=>{
+          try{await navigator.clipboard.writeText(record.original_text);
+            ui.persistedStatus.textContent='Оригинал скопирован';}
+          catch(_){ui.persistedStatus.textContent='Копирование недоступно; нажмите «Просмотреть».';}
+        });row.append(copy);
+        const download=document.createElement('button');download.type='button';download.textContent='TXT';
+        download.addEventListener('click',()=>{
+          const data=new Blob([record.original_text],{type:'text/plain;charset=utf-8'});
+          const url=URL.createObjectURL(data);
+          const a=document.createElement('a');a.href=url;a.download=record.task_id+'.txt';
+          a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+        });row.append(download);
         if (['prepared', 'send_failed'].includes(record.send_status)) {
           const retry = document.createElement('button');
           retry.type = 'button';
@@ -1019,8 +1054,8 @@
             <div class="quick-actions">
               <button type="button" class="quick-file" title="Весь промпт как .txt — без автоматического Send" aria-label="Передать промпт как текстовый файл">Файл</button>
               <button type="button" class="quick-insert" title="Вставить текст, активные модули и Fortis context без Send" aria-label="Вставить текст без отправки">Вставить</button>
-              <button type="button" class="quick-send" aria-label="Сохранить и отправить текстбокс"
-                title="Перенести в штатное поле ChatGPT и отправить через 1 секунду (Enter)">➤</button>
+              <button type="button" class="quick-send" aria-label="Нажать Send для подготовленного сообщения"
+                title="Одна попытка Send только после кнопок Файл или Вставить">Нажать Send</button>
             </div>
           </div>
           <span class="quick-feedback" role="status" aria-live="polite" hidden></span>
@@ -1490,7 +1525,12 @@
         }
         return {ok:false};
       }
-      ui.quickFile.addEventListener('click',()=>handleQuickFile(largePaste.text(ui.quickInput.value)));
+      let quickPrepared=null;
+      ui.quickFile.addEventListener('click',async()=>{
+        const original=largePaste.text(ui.quickInput.value);
+        const outcome=await handleQuickFile(original);
+        quickPrepared=outcome?.ok?{id:outcome.taskId,chat:deps.currentChatId?.(),original}:null;
+      });
 
       async function handleQuickInsert(original, moduleIds = null, profileId = null) {
         if (ui.quickInsert.disabled || fileTransferPending) return {ok:false};
@@ -1543,7 +1583,11 @@
         }
         return {ok:false};
       }
-      ui.quickInsert.addEventListener('click',()=>handleQuickInsert(largePaste.text(ui.quickInput.value)));
+      ui.quickInsert.addEventListener('click',async()=>{
+        const original=largePaste.text(ui.quickInput.value);
+        const outcome=await handleQuickInsert(original);
+        quickPrepared=outcome?.ok?{id:outcome.taskId,chat:deps.currentChatId?.(),original}:null;
+      });
 
       function sendQuickCurrent(originalOverride = null, moduleIds = null, profileId = null) {
         if (ui.quickInsert.disabled) return;
@@ -1614,8 +1658,8 @@
         if(options.focusAfterSend!==false)ui.quickInput.focus();
       }
 
-      // Owner-only separate Send: never reprepare, replace editor text, or
-      // reattach files. The exact saved draft, scoped task_id and file card
+      // Shared prepared Send for both File and Insert: never reprepare, replace text,
+      // or reattach files. The exact saved draft, scoped task_id and file card
       // must already be present. A single synchronous click is attempted.
       function sendPreparedNative(expectedTaskId=null) {
         if(fileTransferPending || queuedPromptController?.isWaitingToSend?.() ||
@@ -1642,7 +1686,10 @@
         // task context; this prevents accidental sending of an orphan file.
         if(!Array.isArray(drafts)||drafts.length!==1 ||
            !/^rs_[0-9a-f]{32}$/.test(drafts[0].reporting_session_id||'') ||
-           !deps.fileContextTextMatches?.(native,drafts[0].submitted_text) ||
+           !['insert','file'].includes(drafts[0].draft_mode) ||
+           !(drafts[0].draft_mode==='insert'
+             ? native===drafts[0].submitted_text
+             : deps.fileContextTextMatches?.(native,drafts[0].submitted_text)) ||
            !native.includes('task_id: '+drafts[0].task_id) ||
            !native.includes('[Fortis task context]'))
           return {ok:false,reason:'prepared_missing'};
@@ -1661,7 +1708,7 @@
       // One-shot owner dispatch enters the EXACT same native File/Insert/Send
       // pipeline as the Notifier buttons. No second upload algorithm and
       // no side effects on the Notifier's editable quick textbox.
-      handleQuickDispatch = async function executeQuickDispatch(mode,text,moduleIds=null,profileId=null) {
+      handleQuickDispatch = async function executeQuickDispatch(mode,text,moduleIds=null,profileId=null,delayMs=1000) {
         if(!['file','insert','send','send_prepared'].includes(mode)||
            typeof text!=='string'||(mode!=='send_prepared'&&!text.trim())||
            (moduleIds!==null&&(!Array.isArray(moduleIds)||
@@ -1675,18 +1722,33 @@
         const existing=queuedPromptController?.readNativeDraft?.();
         if(typeof existing!=='string'||existing.trim())
           return {ok:false,reason:'native_draft_occupied'};
+        const initialChat=deps.currentChatId?.();
         const prepared=await handleQuickFile(text,moduleIds,profileId);
         if(!prepared?.ok)return prepared||{ok:false,reason:'not_confirmed'};
+        if(!Number.isSafeInteger(delayMs)||delayMs<0||delayMs>10000)
+          return {ok:false,reason:'invalid_delay'};
+        if(delayMs)await wait(delayMs);
+        if(initialChat!==deps.currentChatId?.())
+          return {ok:false,reason:'context_mismatch'};
+        // Native draft, task_id and attachment card are rechecked after dwell.
         return sendPreparedNative(prepared.taskId);
       }
-      ui.quickSend.addEventListener('click', ()=>sendQuickCurrent());
-      ui.quickInput.addEventListener('keydown', event => {
-        if (shouldSendQuickTextboxKey(event)) {
-          event.preventDefault();
-          event.stopPropagation();
-          sendQuickCurrent();
+      ui.quickSend.addEventListener('click',()=>{
+        const result=sendPreparedNative();
+        ui.quickFeedback.textContent=result?.ok
+          ? 'Одна попытка штатного Send; приём ChatGPT не подтверждён. Оригинал в локальной истории.'
+          : 'Send не нажат: '+(result?.reason||'не удалось подтвердить подготовку');
+        ui.quickFeedback.hidden=false;
+        if(result?.ok&&quickPrepared?.id===result.taskId&&
+           quickPrepared.chat===deps.currentChatId?.()&&
+           largePaste.text(ui.quickInput.value)===quickPrepared.original){
+          clearLargePaste({focus:false});
+          ui.quickFeedback.hidden=false;
+          ui.quickFeedback.textContent='Send нажат один раз; текст сохранён в истории. Приём ChatGPT не подтверждён.';
         }
+        if(result?.ok)quickPrepared=null;
       });
+      // Enter edits the textbox. No implicit Send; explicit button is required.
       ui.persistSend?.addEventListener('click', sendPersistedCurrent);
       ui.add.addEventListener('click', addCurrent);
       ui.scheduleLater.addEventListener('click', scheduleCurrent);

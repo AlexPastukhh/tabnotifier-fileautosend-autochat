@@ -94,6 +94,9 @@
           !['insert','send','file','send_prepared'].includes(command.mode) ||
           (profileId!==null&&
            (typeof profileId!=='string'||!/^[a-z0-9][a-z0-9_-]{0,55}$/.test(profileId))) ||
+          (command.delay_ms !== undefined &&
+            (!Number.isSafeInteger(command.delay_ms)||command.delay_ms<0||
+             command.delay_ms>10000||command.mode!=='send')) ||
           typeof command.text !== 'string' ||
           (command.mode!=='send_prepared'&&!command.text.trim()) ||
           (moduleIds!==null&&(!Array.isArray(moduleIds) || moduleIds.length>100 ||
@@ -120,8 +123,8 @@
              (deps.readComposerText?.(composer)||composer.value||composer.innerText||'').trim())
             return;
           const outcome=await quickAction({
-            mode:command.mode,text:command.text,
-            moduleIds,profileId
+            mode:command.mode,text:command.text, moduleIds,profileId,
+            ...(command.mode==='send' ? {delayMs:command.delay_ms===undefined?1000:command.delay_ms} : {})
           });
           if(command.mode==='file'&&typeof outcome?.detail==='string'&&
              outcome.detail.length<=512)detail=outcome.detail;
