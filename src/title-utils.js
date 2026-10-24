@@ -1,6 +1,6 @@
 (function (root, factory) {
   const deps = typeof require === 'function'
-    ? Object.assign({}, require('./config.js'), root.ChatGPTTabNotifier || {})
+    ? Object.assign({}, require('./config.js'), require('./task-favicon.js'), root.ChatGPTTabNotifier || {})
     : (root.ChatGPTTabNotifier || {});
   const api = factory(deps);
   if (typeof module === 'object' && module.exports) module.exports = api;
@@ -45,18 +45,17 @@
           break;
         }
       }
+      const withoutConnection = value.replace(/^\[Observatory: (?:нет связи|нет доступа|статус устарел|старый API|проверка|неполная сводка)\]\s*/, '');
+      if (withoutConnection !== value) { value = withoutConnection; removed = true; }
     }
     return value.trim();
   }
 
   function faviconSvg(type) {
-    const svgs = {
-      working: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#f59e0b"/><circle cx="18" cy="32" r="5" fill="white"/><circle cx="32" cy="32" r="5" fill="white"/><circle cx="46" cy="32" r="5" fill="white"/></svg>',
-      fresh: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#dc2626"/><path d="M20 43h24l-4-6V28c0-6-3-11-8-11s-8 5-8 11v9z" fill="white"/><circle cx="32" cy="48" r="4" fill="white"/></svg>',
-      viewed: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#64748b"/><path d="M16 33 L27 44 L49 20" fill="none" stroke="white" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-      uploading: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#2563eb"/><path d="M32 13v29M21 24l11-11 11 11M18 47h28" fill="none" stroke="white" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-    };
-    return svgs[type] ? `data:image/svg+xml,${encodeURIComponent(svgs[type])}` : '';
+    const kind = { working: 'hourglass', fresh: 'check', viewed: 'check', uploading: 'upload' }[type];
+    // Legacy/raw state alone never grants an Observatory status color.
+    return kind ? deps.monoFaviconSvg({ source: type === 'uploading' ? 'local' : 'dom',
+      kind, unread: type === 'fresh' }) : '';
   }
 
   return { removeUnpairedSurrogates, cleanTitle, faviconSvg };

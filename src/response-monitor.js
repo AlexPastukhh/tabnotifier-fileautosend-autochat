@@ -34,7 +34,8 @@
     return Boolean(document.querySelector(selectors.join(',')));
   }
 
-  function createResponseMonitor({ tabState, notifications, beforeArm = () => {}, onFinished = () => {} }) {
+  function createResponseMonitor({ tabState, notifications, beforeArm = () => {}, onFinished = () => {}, onArmed = () => {}, isDomEnabled = () => true }) {
+    let externallyFinished = false;
     let armed = false;
     let sawGenerating = false;
     let runId = 0;
@@ -71,8 +72,10 @@
     }
 
     function armAnswer(source = 'unknown') {
+      if (!isDomEnabled()) return false;
       if (armed && Date.now() - lastArmAt < 1200) return;
       beforeArm();
+      externallyFinished = false;
       lastArmAt = Date.now();
       runId += 1;
       armed = true;
@@ -87,10 +90,12 @@
       currentFingerprint = snapshot.fingerprint;
       lastAssistantChangeAt = Date.now();
       tabState.setState('working');
+      try { onArmed(); } catch (_) { /* optional */ }
 
       const thisRun = runId;
       armTimer = setTimeout(() => {
-        if (armed && runId === thisRun && !sawGenerating && !responseChanged()) {
+        // Do not discard an armed response in Observatory-only test mode.
+        if (isDomEnabled() && armed && runId === thisRun && !sawGenerating && !responseChanged()) {
           armed = false;
           tabState.setState('idle');
         }
@@ -99,7 +104,7 @@
     }
 
     function finishAnswer() {
-      if (!armed || finishedRunId === runId) return;
+      if (!isDomEnabled() || !armed || finishedRunId === runId) return;
       finishedRunId = runId;
       armed = false;
       sawGenerating = false;
@@ -108,6 +113,41 @@
       tabState.setState(unread ? 'fresh' : 'viewed');
       notifications.notifyFinished();
       try { onFinished(); } catch (error) { console.warn('[ChatGPT notifier] Ошибка действия после завершения ответа:', error); }
+    }
+
+    function startFromExternal() {
+      // The browser never treats an Observatory report as a synthetic user click.
+      if (armed && tabState.getState() === 'observatory-working') return true;
+      clearTimers();
+      externallyFinished = false;
+      if (!armed) {
+        runId += 1;
+        armed = true;
+        sawGenerating = false;
+        finishedRunId = -1;
+        const snapshot = assistantSnapshot();
+        baselineAssistantCount = snapshot.count;
+        baselineFingerprint = snapshot.fingerprint;
+        currentAssistantCount = snapshot.count;
+        currentFingerprint = snapshot.fingerprint;
+        lastAssistantChangeAt = Date.now();
+      }
+      lastArmAt = Date.now();
+      tabState.setState('observatory-working');
+      return true;
+    }
+
+    function finishFromExternal() {
+      if (!armed || finishedRunId === runId) return false;
+      externallyFinished = true;
+      finishedRunId = runId;
+      armed = false;
+      sawGenerating = false;
+      clearTimers();
+      const unread = document.hidden || !document.hasFocus();
+      tabState.setState(unread ? 'observatory-fresh' : 'observatory-viewed');
+      notifications.notifyFinished('observatory');
+      return true;
     }
 
     function scheduleFinish() {
@@ -121,22 +161,38 @@
     }
 
     function check() {
+      // In Observatory-only mode DOM neither begins nor ends the response.
+      if (!isDomEnabled()) {
+        if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+        return;
+      }
       const generating = isGenerating();
+      // Ignore stuck generating DOM until a real new send or generator clears.
+      if (externallyFinished) {
+        if (generating) return;
+        externallyFinished = false;
+      }
       if (generating) {
         if (!armed) armAnswer('generation-detected');
         else updateAssistantSnapshot();
         sawGenerating = true;
         if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
-        tabState.setState('working');
+        if (tabState.getState() !== 'observatory-working') tabState.setState('working');
         return;
       }
       if (!armed) return;
       updateAssistantSnapshot();
+      // DOM still detects the start but cannot conclude a response in test mode.
+      if (!isDomEnabled()) {
+        if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+        return;
+      }
       if (sawGenerating) { scheduleFinish(); return; }
       if (responseChanged() && Date.now() - lastAssistantChangeAt >= deps.SETTINGS.fallbackQuietDelayMs) finishAnswer();
     }
 
     function resetForNavigation() {
+      externallyFinished = false;
       armed = false;
       sawGenerating = false;
       finishedRunId = -1;
@@ -149,7 +205,7 @@
       lastAssistantChangeAt = Date.now();
     }
 
-    return { armAnswer, check, resetForNavigation, isArmed: () => armed };
+    return { armAnswer, startFromExternal, check, resetForNavigation, finishFromExternal, isArmed: () => armed };
   }
 
   return { assistantSnapshot, isGenerating, createResponseMonitor };

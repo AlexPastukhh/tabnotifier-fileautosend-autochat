@@ -9,11 +9,11 @@
   'use strict';
 
   function createNotificationService(tabState) {
-    function showDesktopNotification() {
+    function showDesktopNotification(source = 'dom') {
       if (!deps.SETTINGS.desktopNotificationEnabled || typeof GM_notification !== 'function') return;
       try {
         GM_notification({
-          title: 'ChatGPT — ответ готов',
+          title: source === 'observatory' ? 'Fortis Observatory — завершено по событию чата' : 'ChatGPT — ответ готов',
           text: tabState.getNaturalTitle(),
           timeout: 6500,
           silent: false,
@@ -24,10 +24,10 @@
       }
     }
 
-    function notifyFinished() {
+    function notifyFinished(source = 'dom') {
       const background = document.hidden || !document.hasFocus();
       if (deps.SETTINGS.notifyOnlyInBackground && !background) return;
-      showDesktopNotification();
+      showDesktopNotification(source);
     }
 
     return { showDesktopNotification, notifyFinished };

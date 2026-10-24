@@ -1,0 +1,324 @@
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "chatgpt-tab-notifier",
+-  "version": "5.7.31",
++  "version": "5.7.32",
+   "private": true,
+   "scripts": {
+     "build": "node build-userscript.mjs",
+--- a/src/config.js
++++ b/src/config.js
+@@ -5,7 +5,7 @@
+ })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+   'use strict';
+ 
+-  const SCRIPT_VERSION = '5.7.31';
++  const SCRIPT_VERSION = '5.7.32';
+ 
+   const SETTINGS = Object.freeze({
+     desktopNotificationEnabled: true,
+--- a/src/persisted-messages.js
++++ b/src/persisted-messages.js
+@@ -159,15 +159,29 @@
+       }
+       guidance.push('[/Fortis task context]');
+       const guidanceText = guidance.join('\n');
+-      // File drafts must never push a 68k+ original back into ProseMirror.
+-      // The full original stays in the attachment and in the local record.
+-      const transportText = fileName
+-        ? 'Полный текст моего запроса находится в прикреплённом файле ' +
+-          JSON.stringify(fileName) + '. Прочитай его полностью перед ответом. ' +
+-          'Этот файл — точный оригинал запроса, а не пример или приложение к другому запросу.'
+-        : original.trimEnd();
++      // Full file payload contains the exact original, Fortis task metadata,
++      // and (in prepareDraft) the selected Planning Helper prompt/modules.
++      // ProseMirror gets ONLY a small, task-bound pointer.
++      if (fileName) {
++        const pointer = [
++          'Полный текст запроса, Fortis task context и выбранные модули находятся в файле ' +
++            JSON.stringify(fileName) + '. Прочитай весь файл перед ответом.',
++          '[Fortis task context]',
++          'task_id: ' + taskId,
++          ...(repoContext?.reporting_session_id ?
++            ['reporting_session_id: ' + repoContext.reporting_session_id] : []),
++          ...(repoContext?.conversation_id ?
++            ['conversation_id: ' + repoContext.conversation_id] : []),
++          'route: repo',
++          'Инструкции и команды для текущей задачи находятся внутри файла.',
++          '[/Fortis task context]'
++        ].join('\n');
++        return { task_id: taskId, original_text: original,
++          submitted_text: pointer,
++          file_text: original + '\n\n' + guidanceText };
++      }
+       return { task_id: taskId, original_text: original,
+-        submitted_text: transportText + '\n\n' + guidanceText };
++        submitted_text: original.trimEnd() + '\n\n' + guidanceText };
+     }
+     return { prepare };
+   }
+@@ -353,7 +367,15 @@
+         prepared.submitted_text = original +
+           prepared.submitted_text.slice(trimmedPrefix.length);
+       }
+-      if (extraText) prepared.submitted_text += '\n\n' + extraText;
++      if (mode === 'file') {
++        if (typeof prepared.file_text !== 'string' ||
++            !prepared.file_text.startsWith(original + '\n\n') ||
++            !prepared.file_text.includes('task_id: ' + prepared.task_id)) {
++          notify('Полный файл с Fortis context не подготовлен.');
++          return null;
++        }
++        if (extraText) prepared.file_text += '\n\n' + extraText;
++      } else if (extraText) prepared.submitted_text += '\n\n' + extraText;
+       if (mode === 'file' && nativePrefix) {
+         // The previous native text is explicitly retained, not overwritten.
+         // A full read-back of this merged draft is required before manual Send.
+@@ -365,8 +387,11 @@
+         notify('Текст подготовленного черновика больше 512 КиБ.');
+         return null;
+       }
++      // Do not double-store the full payload in synchronous GM storage.
++      // The full original is saved independently in original_text.
++      const {file_text: fileText, ...storedPrepared} = prepared;
+       const record = {
+-        version: 1, ...prepared, conversation_id: chatId,
++        version: 1, ...storedPrepared, conversation_id: chatId,
+         reporting_session_id: validPair ? pair.reporting_session_id : null,
+         observatory_origin: validPair ? pair.origin : null,
+         intent_version: 1, send_revision: 0,
+@@ -382,7 +407,8 @@
+       }
+       try { update(record.task_id, { intent_ready: true }); } catch (_) { /* local original already verified */ }
+       notify('Черновик и task_id сохранены локально. Send не нажат.');
+-      return { task_id: record.task_id, submitted_text: record.submitted_text };
++      return { task_id: record.task_id, submitted_text: record.submitted_text,
++        ...(mode === 'file' ? { file_text: fileText } : {}) };
+     }
+ 
+     function previewPreparedNativeDraft(nativeText, { fileNameVisible = () => false } = {}) {
+--- a/src/upload-button-ui.js
++++ b/src/upload-button-ui.js
+@@ -1332,27 +1332,22 @@
+         return prepared;
+       }
+ 
+-      async function completeFileDraft(originalText, file, profile, chatId, epoch) {
++      async function completeFileDraft(record, file, chatId, epoch, nativeBefore) {
+         if (epoch !== fileTransferEpoch || !currentFileContext(chatId)) {
+           fileStatus('Чат изменился. Исходник остался в Textbox; Send не нажимался.');
+-          return false;
+-        }
+-        // Do NOT insist on an empty native composer. Preserve whatever is
+-        // already there, including previous task contexts and user text.
+-        const nativeBefore = queuedPromptController.readNativeDraft?.();
+-        if (typeof nativeBefore !== 'string') {
+-          fileStatus('Файл прикреплён, но нативный редактор недоступен. ' +
+-            'Исходник сохранён, Send не нажат.');
+-          return false;
+-        }
+-        const record = persistentMessageController.prepareDraft(originalText, {
+-          mode: 'file', fileName: file.name, extraText: profile.extraText,
+-          nativePrefix: nativeBefore
+-        });
+-        if (!record) {
+-          fileStatus(persistentMessageController.getLastStatus?.() ||
+-            'Не удалось сохранить task_id. Файл прикреплён, Send не нажат.');
+-          return false;
++          return {ok:false,reason:'context_mismatch'};
++        }
++        // task_id, exact original and ALL modules/context were prepared
++        // BEFORE uploading. Do not generate a different task_id after attach.
++        const nativeNow = queuedPromptController.readNativeDraft?.();
++        if (typeof nativeNow !== 'string' || nativeNow !== nativeBefore ||
++            !record || typeof record.submitted_text !== 'string' ||
++            !(nativeBefore
++              ? record.submitted_text.startsWith(nativeBefore + '\n\n')
++              : record.submitted_text.length > 0)) {
++          fileStatus('Редактор ChatGPT изменился при прикреплении файла. ' +
++            'Контекст не вставлен и Send не нажат.');
++          return {ok:false,reason:'context_mismatch'};
+         }
+         const addition = record.submitted_text.slice(nativeBefore.length);
+         // Only the NEW short context is inserted into a busy native editor.
+@@ -1368,9 +1363,9 @@
+           : await queuedPromptController.insertOnly(record.submitted_text,
+               {fileContext:true});
+         fileStatus(result.ok
+-          ? 'Файл прикреплён, модули и Fortis task context добавлены без замены ' +
+-            'существующего текста. SHA-256 записан, Send НЕ нажат.'
+-          : 'Файл прикреплён, но контекст не добавлен: ' + result.reason +
++          ? 'Полный исходник, модули и Fortis task context находятся в файле; ' +
++            'в редакторе только ссылка с task_id. SHA-256 записан, Send НЕ нажат.'
++          : 'Файл прикреплён, но ссылка с task_id не добавлена: ' + result.reason +
+             ' Не отправляй до ручной проверки.');
+         return result.ok ? {ok:true,taskId:record.task_id} : {ok:false,reason:'context_mismatch'};
+       }
+@@ -1414,9 +1409,20 @@
+             return {ok:false,reason:reservation.duplicate?'duplicate':'not_confirmed',
+               detail:safeNotifierFileDetail(lastFileStatus)};
+           }
+-          const file = createPromptTextFile(originalText,
+-            'fortis-prompt-' + Date.now().toString(36) + '.txt');
+-          fileStatus('Создал ' + file.name + '. Прикрепляю к текущему чату…');
++          // Create a single task context and complete attachment BEFORE the
++          // single upload attempt. Both owner Viewer and Notifier use this.
++          const fileName='fortis-prompt-' + Date.now().toString(36) + '.txt';
++          const nativeBefore=queuedPromptController.readNativeDraft?.();
++          if (typeof nativeBefore !== 'string')
++            throw Error('Нативный редактор недоступен. Файл не прикреплялся.');
++          const record=persistentMessageController.prepareDraft(originalText,{
++            mode:'file',fileName,extraText:profile.extraText,nativePrefix:nativeBefore
++          });
++          if (!record || typeof record.file_text !== 'string' ||
++              !record.file_text.includes('task_id: ' + record.task_id))
++            throw Error('Не удалось подготовить полный файл с task_id. Файл не прикреплялся.');
++          const file = createPromptTextFile(record.file_text,fileName);
++          fileStatus('Создал полный ' + file.name + '. Прикрепляю к текущему чату…');
+           const transfer = await attemptPromptFileOnce({
+             tryDirectInput: () => tryFileInputs(file, context),
+             findPlus: () => {
+@@ -1445,7 +1451,7 @@
+           }
+           if (transfer.confirmed) {
+             let completed;
+-            try {completed=await completeFileDraft(originalText, file, profile, chatId, epoch)}
++            try {completed=await completeFileDraft(record, file, chatId, epoch, nativeBefore)}
+             catch (_) {
+               fileStatus('Карточка файла обнаружена, но Fortis-контекст не подтверждён. ' +
+                 'Не отправляй сообщение и не прикрепляй файл повторно.');
+@@ -1566,6 +1572,29 @@
+         }catch(error){
+           ui.quickFeedback.textContent=error?.message||'Модули недоступны';
+           ui.quickFeedback.hidden=false;return;
++        }
++        // A short original may expand beyond safe rich-editor size after
++        // Planning Helper modules. Auto-route the EXPLICIT quick Send through
++        // the same full-File + verified single native click pipeline.
++        if(originalOverride===null &&
++           originalText.length + String(options.extraText||'').length >= LARGE_PASTE_THRESHOLD) {
++          const existing=queuedPromptController?.readNativeDraft?.();
++          if(typeof existing!=='string'||existing.trim()){
++            ui.quickFeedback.textContent='Редактор уже содержит текст; отправка через файл отменена.';
++            ui.quickFeedback.hidden=false;
++            return {ok:false,reason:'native_draft_occupied'};
++          }
++          void (async()=>{
++            const prepared=await handleQuickFile(originalText);
++            if(!prepared?.ok)return;
++            const result=sendPreparedNative(prepared.taskId);
++            if(result?.ok){
++              largePaste.clear();ui.quickInput.value='';
++              ui.quickFeedback.textContent='Файл отправлен через штатную кнопку; приём ChatGPT не подтверждён.';
++              ui.quickFeedback.hidden=false;
++            }
++          })();
++          return;
+         }
+         const id = persistentMessageController?.saveAndSend(originalText,options);
+         ui.quickFeedback.textContent = id
+@@ -1588,7 +1617,7 @@
+       // Owner-only separate Send: never reprepare, replace editor text, or
+       // reattach files. The exact saved draft, scoped task_id and file card
+       // must already be present. A single synchronous click is attempted.
+-      function sendPreparedNative() {
++      function sendPreparedNative(expectedTaskId=null) {
+         if(fileTransferPending || queuedPromptController?.isWaitingToSend?.() ||
+            uploadController?.isArmed?.() || uploadController?.isConfirmingSend?.())
+           return {ok:false,reason:'busy'};
+@@ -1618,6 +1647,9 @@
+            !native.includes('[Fortis task context]'))
+           return {ok:false,reason:'prepared_missing'};
+         const taskId=drafts[0].task_id;
++        // Owner Send must send ONLY the File it just prepared.
++        if (expectedTaskId !== null && taskId !== expectedTaskId)
++          return {ok:false,reason:'context_mismatch'};
+         const committed=persistentMessageController.recordManualDraftSend(native,
+           {fileNameVisible:fileVisible});
+         if(committed!==taskId)return {ok:false,reason:'not_confirmed'};
+@@ -1637,7 +1669,15 @@
+         if(mode==='send_prepared')return sendPreparedNative();
+         if(mode==='file')return handleQuickFile(text,moduleIds,profileId);
+         if(mode==='insert')return handleQuickInsert(text,moduleIds,profileId);
+-        return sendQuickCurrent(text,moduleIds,profileId);
++        // Explicit owner "Отправить": file contains the original, complete
++        // Fortis guidance and selected modules. Click native Send once only
++        // after the file card and exact short task pointer are verified.
++        const existing=queuedPromptController?.readNativeDraft?.();
++        if(typeof existing!=='string'||existing.trim())
++          return {ok:false,reason:'native_draft_occupied'};
++        const prepared=await handleQuickFile(text,moduleIds,profileId);
++        if(!prepared?.ok)return prepared||{ok:false,reason:'not_confirmed'};
++        return sendPreparedNative(prepared.taskId);
+       }
+       ui.quickSend.addEventListener('click', ()=>sendQuickCurrent());
+       ui.quickInput.addEventListener('keydown', event => {
+--- a/tests/persisted-messages.test.mjs
++++ b/tests/persisted-messages.test.mjs
+@@ -470,7 +470,7 @@
+   assert.equal(ctl.recordManualDraftSend(draft.submitted_text),null);
+ });
+ 
+-test('file draft stores exact original, only filename/context/modules in native text',()=>{
++test('File contains exact original, all Fortis guidance and modules; native is a short pointer',()=>{
+   const f=fixture();
+   const ctl=f.make();
+   const original='Большой 🌍 запрос\n'.repeat(4500);
+@@ -482,8 +482,16 @@
+   assert.equal(ctl.load(draft.task_id).file_name,'fortis-prompt-unit-test.txt');
+   assert.ok(draft.submitted_text.length < 5000);
+   assert.match(draft.submitted_text,/fortis-prompt-unit-test\.txt/);
+-  assert.match(draft.submitted_text,/Модуль профиля Helper/);
++  assert.doesNotMatch(draft.submitted_text,/Модуль профиля Helper/);
+   assert.match(draft.submitted_text,new RegExp(draft.task_id));
++  assert.ok(draft.file_text.startsWith(original+'\n\n'),
++    'attachment must begin with the exact untouched original, even with trailing whitespace');
++  assert.match(draft.file_text,/\[Fortis task context\]/);
++  assert.match(draft.file_text,/Модуль профиля Helper/);
++  assert.match(draft.file_text,new RegExp(draft.task_id));
++  assert.ok(!('file_text' in ctl.load(draft.task_id)),
++    'large generated payload must not be duplicated inside synchronous GM storage');
++  assert.equal(ctl.load(draft.task_id).original_text,original);
+   assert.equal(f.state.sends.length,0);
+   assert.equal(ctl.recordManualDraftSend(draft.submitted_text),null);
+   assert.equal(ctl.recordManualDraftSend(draft.submitted_text,
+@@ -629,8 +637,10 @@
+  assert.deepEqual(candidate?.map(x=>x.task_id),[draft.task_id]);
+  assert.equal(ctl.previewPreparedNativeDraft(rich.replace(draft.task_id,
+   'task_'+'f'.repeat(32)),opts).length,0,'wrong task ID not accepted');
+- assert.equal(ctl.previewPreparedNativeDraft(rich.replace('Модуль с двумя  пробелами',
+-  'Модуль с двумя пробелами'),opts).length,0,'loss of spaces is detected');
++ assert.match(draft.file_text,/Модуль с двумя  пробелами/);
++ assert.doesNotMatch(draft.submitted_text,/Модуль с двумя  пробелами/);
++ assert.equal(ctl.previewPreparedNativeDraft(rich.replace('Fortis task context',
++  'Fortis task contexx'),opts).length,0,'native file pointer changes are rejected');
+  assert.equal(ctl.previewPreparedNativeDraft(rich,
+   {fileNameVisible:()=>false}).length,0,'file card still required');
+  assert.equal(ctl.recordManualDraftSend(rich,opts),draft.task_id,
+@@ -648,8 +658,9 @@
+     ctl.prepareDraft('Unpaired file',{mode:'file',fileName:'fortis-prompt-offline.txt'})
+   ]){
+     assert.match(draft.submitted_text,new RegExp('conversation_id: '+f.state.chat));
+-    assert.match(draft.submitted_text,/локальную очередь без --session/);
+-    assert.match(draft.submitted_text,/каждый полный interim\/final/);
++    const full=draft.file_text||draft.submitted_text;
++    assert.match(full,/локальную очередь без --session/);
++    assert.match(full,/каждый полный interim\/final/);
+     assert.doesNotMatch(draft.submitted_text,/--session rs_|reporting_session_id:/);
+     assert.equal(ctl.load(draft.task_id).reporting_session_id,null);
+     assert.equal(ctl.load(draft.task_id).archive_status,'pending_activity');
+--- a/tests/upload-button-ui.test.mjs
++++ b/tests/upload-button-ui.test.mjs
+@@ -406,7 +406,9 @@
+   const js=source();
+   assert.match(js,/function prepareActiveModules\(originalText, moduleIds = null, profileId = null\)/);
+   assert.match(js,/textboxProfileManager\.prepare\(originalText\)/);
+-  assert.match(js,/mode: 'file', fileName: file\.name, extraText: profile\.extraText/);
++  assert.match(js,/mode:'file',fileName,extraText:profile\.extraText,nativePrefix:nativeBefore/);
++  assert.match(js,/createPromptTextFile\(record\.file_text,fileName\)/);
++  assert.match(js,/await completeFileDraft\(record, file, chatId, epoch, nativeBefore\)/);
+   assert.match(js,/mode: 'insert', extraText: profile\.extraText/);
+   assert.match(js,/await queuedPromptController\.insertOnly\(record\.submitted_text\)/);
+   const block=js.slice(js.indexOf('async function completeFileDraft('),

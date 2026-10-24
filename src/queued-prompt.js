@@ -12,6 +12,16 @@
   const FROM_COMPOSER_MAX_ATTEMPTS = 5;
   const FROM_COMPOSER_CLEAR_MAX_ATTEMPTS = 4;
   const QUEUE_SEND_CONFIRM_TIMEOUT_MS = 2200;
+  const LARGE_NATIVE_INSERT_THRESHOLD = 12000;
+  const NATIVE_INSERT_CHUNK = 4096;
+
+  function nextInsertBoundary(text, offset) {
+    let end = Math.min(text.length, offset + NATIVE_INSERT_CHUNK);
+    // Never cut a Unicode surrogate pair at the chunk boundary.
+    if (end < text.length && end > offset &&
+        text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF) end--;
+    return end;
+  }
 
   function readComposerText(composer) {
     if (!composer) return '';
@@ -90,6 +100,32 @@
     return false;
   }
 
+  function appendComposerChunk(composer, chunk, first) {
+    if (first) return setComposerText(composer, chunk);
+    const native = (
+      (typeof HTMLTextAreaElement !== 'undefined' && composer instanceof HTMLTextAreaElement) ||
+      (typeof HTMLInputElement !== 'undefined' && composer instanceof HTMLInputElement)
+    );
+    if (native) return setNativeValue(composer, composer.value + chunk);
+    if (!(composer?.isContentEditable || composer?.getAttribute?.('contenteditable') === 'true')) return false;
+    // Apply a bounded edit to the native rich editor, yielding to the browser
+    // between chunks. Never replace the entire growing contenteditable tree.
+    try {
+      composer.focus();
+      const selection = window.getSelection?.();
+      if (!selection || typeof document.createRange !== 'function' ||
+          typeof document.execCommand !== 'function') return false;
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (!document.execCommand('insertText', false, chunk)) return false;
+      dispatchComposerInput(composer, chunk);
+      return true;
+    } catch (_) { return false; }
+  }
+
   // contenteditable ChatGPT может менять представление переносов строк после вставки.
   // Для проверки принадлежности текста сравниваем не сырой innerText, а каноническую форму.
   function normalizeComposerTextForOwnership(value) {
@@ -102,6 +138,58 @@
       .replace(/\n+/g, '\n')
       .trim();
   }
+
+  // File-mode rich-editor readback only: browsers may add or remove
+  // EMPTY paragraph separators when execCommand('insertText') builds <p>
+  // nodes. Do not use the queue ownership normalizer here: that would also
+  // discard repeated spaces, tabs and invisible characters from instructions.
+  // Non-empty lines and their order MUST remain byte-for-byte equal (except
+  // CRLF vs LF and browser NBSP vs a plain space). This checks the entire
+  // prepared file instruction/context, NOT the uploaded file's contents.
+  function fileContextTextMatches(received, expected) {
+    if (typeof received !== 'string' || typeof expected !== 'string' ||
+        !received.trim() || !expected.trim()) return false;
+    const meaningfulLines = text => text.replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .split('\n')
+      .filter(line => line !== '');
+    const actual = meaningfulLines(received);
+    const wanted = meaningfulLines(expected);
+    return actual.length === wanted.length &&
+      actual.every((line, index) => line === wanted[index]);
+  }
+
+  // File uses a deliberately narrow tolerance for rendered blank lines;
+  // ordinary Insert and other queue actions remain exact.
+  function insertOnlyTextMatches(composer, expected, { fileContext = false } = {}) {
+    if (!composer) return false;
+    const native = (typeof HTMLTextAreaElement !== 'undefined' &&
+      composer instanceof HTMLTextAreaElement) ||
+      (typeof HTMLInputElement !== 'undefined' &&
+      composer instanceof HTMLInputElement);
+    // Unlike readComposerText (used for tolerant queue ownership), no NBSP,
+    // newline or Unicode substitution is allowed when claiming exact transfer.
+    const received = native ? composer.value :
+      (typeof composer.innerText === 'string' ? composer.innerText :
+        composer.textContent);
+    if (typeof received !== 'string') return false;
+    if (received === expected) return true;
+    return fileContext && !native && fileContextTextMatches(received, expected);
+  }
+
+  // Empty ProseMirror/contenteditable usually renders a structural <p><br>
+  // placeholder: its innerText can be "\n" even though no text is entered.
+  // This check is ONLY for the untouched initial state. It must never be
+  // used for verifying an inserted prefix or the complete prompt.
+  function isComposerVisiblyEmpty(composer) {
+    if (!composer) return false;
+    if (readComposerText(composer).trim()) return false;
+    // A hidden text node would otherwise be masked by a structural newline
+    // returned from innerText; do not overwrite an occupied rich composer.
+    if (typeof composer.textContent === 'string' && composer.textContent.trim()) return false;
+    return true;
+  }
+
 
   function composerTextBelongsToJob(currentText, job) {
     if (!job?.insertedByScript) return false;
@@ -129,7 +217,7 @@
     return { confirmed: false, reason: 'waiting' };
   }
 
-  function createQueuedPromptController({ onChange = () => {} } = {}) {
+  function createQueuedPromptController({ onChange = () => {}, onSendResult = () => {}, beforeSendClick = () => true } = {}) {
     let items = [];
     let nextId = 1;
     let pending = null;
@@ -174,17 +262,17 @@
     }
 
     function getItems() {
-      return items.map(item => ({ ...item }));
+      return items.filter(item => !item.persistent).map(item => ({ ...item }));
     }
 
     function getItem(id) {
       return items.find(item => item.id === id) || null;
     }
 
-    function add(text) {
+    function add(text, options = {}) {
       const value = String(text || '').trim();
       if (!value) return null;
-      const item = { id: makeId(), text: value, createdAt: Date.now() };
+      const item = { id: makeId(), text: value, createdAt: Date.now(), persistent: options.persistent === true };
       items.push(item);
       clearStatusTimer();
       lastStatus = '';
@@ -349,8 +437,13 @@
     }
 
     function cancelPending() {
+      const abandoned = pending;
       clearRetry();
       pending = null;
+      if (abandoned?.source === 'manual-persisted') {
+        try { onSendResult({ source: abandoned.source, itemIds: [...abandoned.itemIds],
+          status: abandoned.clickedAt ? 'unconfirmed' : 'failed' }); } catch (_) {}
+      }
       jobSerial += 1; // Инвалидирует уже запланированные callback старой операции.
     }
 
@@ -392,9 +485,14 @@
 
     function failPending(message, expectedJobId = null) {
       if (expectedJobId !== null && (!pending || pending.jobId !== expectedJobId)) return false;
+      const failedJob = pending;
       clearRetry();
       pending = null;
       jobSerial += 1;
+      if (failedJob) {
+        try { onSendResult({ source: failedJob.source, itemIds: [...failedJob.itemIds],
+          status: failedJob.clickedAt ? 'unconfirmed' : 'failed' }); } catch (_) {}
+      }
       setStatus(message, 4500);
       console.warn(`[ChatGPT notifier] ${message}`);
       return false;
@@ -409,12 +507,15 @@
       clearStatusTimer();
       lastStatus = '';
       emitChange();
-      console.info(`[ChatGPT notifier] Отправка из очереди (${job.source}) подтверждена:`, job.text);
+      try { onSendResult({ source: job.source, itemIds: [...job.itemIds], status: 'sent' }); } catch (_) {}
+      console.info(`[ChatGPT notifier] Отправка из очереди (${job.source}) подтверждена.`);
       return true;
     }
 
-    function beginSend({ itemIds, text, allowWhileGenerating, source, timeoutMs }) {
+    function beginSend({ itemIds, text, allowWhileGenerating, source, timeoutMs,
+      minComposerDwellMs = 0 }) {
       const ids = Array.from(itemIds || []).filter(id => getItem(id));
+      if (insertingOnly || pending?.source === 'manual-persisted') return false;
       const value = String(text || '').trim();
       if (!ids.length || !value) return false;
 
@@ -427,6 +528,11 @@
         text: value,
         allowWhileGenerating: Boolean(allowWhileGenerating),
         source: source || 'queue',
+        // Opt-in only: quick textbox leaves the text visible in the native
+        // composer for ~1 second before clicking the real Send button.
+        // Old queue, file auto-send and delayed actions continue unchanged.
+        minComposerDwellMs: source === 'manual-persisted'
+          ? Math.min(1500, Math.max(0, Number(minComposerDwellMs) || 0)) : 0,
         deadline: Date.now() + Math.max(1000, Number(timeoutMs) || 7000),
         phase: 'prepare',
         clickedAt: 0,
@@ -437,7 +543,9 @@
         clickedSnapshotNormalized: '',
         clickedComposer: null,
         clickedContainer: null,
-        clickedButton: null
+        clickedButton: null,
+        largeInsert: source === 'manual-persisted' && value.length >= LARGE_NATIVE_INSERT_THRESHOLD
+          ? { cursor: 0, accumulated: '', composer: null } : null
       };
       lastStatus = '';
       emitChange();
@@ -493,6 +601,42 @@
         return false;
       }
 
+      if (job.largeInsert && job.largeInsert.cursor < job.text.length) {
+        const progress = job.largeInsert;
+        if (progress.composer && progress.composer !== composer)
+          return failPending('Редактор сменился при переносе большого промпта; отправка отменена.', job.jobId);
+        if (progress.cursor === 0 && currentText &&
+            normalizeComposerTextForOwnership(currentText) === job.expectedNormalized) {
+          progress.cursor = job.text.length;
+          progress.accumulated = job.text;
+          progress.composer = composer;
+        } else {
+          if (normalizeComposerTextForOwnership(currentText) !==
+              normalizeComposerTextForOwnership(progress.accumulated)) {
+            return failPending('Редактор занят или изменён при переносе большого текста. Автоотправки не было.', job.jobId);
+          }
+          const until = nextInsertBoundary(job.text, progress.cursor);
+          const chunk = job.text.slice(progress.cursor, until);
+          if (!appendComposerChunk(composer, chunk, progress.cursor === 0)) {
+            return failPending('Не удалось вставить часть большого текста в ChatGPT. Оригинал сохранён локально.', job.jobId);
+          }
+          progress.cursor = until;
+          progress.accumulated += chunk;
+          progress.composer = composer;
+        }
+        if (progress.cursor >= job.text.length) {
+          const inserted = normalizeComposerTextForOwnership(readComposerText(composer));
+          if (inserted !== job.expectedNormalized) {
+            return failPending('Большой промпт вставлен не полностью; Send отменён.', job.jobId);
+          }
+          job.insertedByScript = true;
+          job.insertedAt = Date.now();
+          job.insertedSnapshotNormalized = inserted;
+        }
+        scheduleRetry(25);
+        return false;
+      }
+
       const ownsCurrentText = composerTextBelongsToJob(currentText, job);
 
       if (currentText && !ownsCurrentText && normalizeComposerTextForOwnership(currentText) !== job.expectedNormalized) {
@@ -524,6 +668,18 @@
         job.insertedSnapshotNormalized = normalizeComposerTextForOwnership(currentText);
       }
 
+      // Wait AFTER native insertion, not before it. During this interval,
+      // React can finish processing input and the user can see/edit text.
+      // Ownership is checked again on every retry; an edited composer is
+      // never silently clicked by a delayed operation.
+      if (job.minComposerDwellMs > 0) {
+        const remaining = job.minComposerDwellMs - (now - job.insertedAt);
+        if (remaining > 0) {
+          scheduleRetry(Math.min(remaining, 160));
+          return false;
+        }
+      }
+
       // Ищем Send заново уже ПОСЛЕ того, как ChatGPT получил input-событие.
       const sendButton = context?.sendButton || deps.findSendButton(form);
       if (!deps.isSendButtonReady(sendButton)) {
@@ -531,7 +687,14 @@
         return false;
       }
 
-      console.info(`[ChatGPT notifier] Нажимаю штатный Send (${job.source}):`, job.text);
+      try {
+        if (beforeSendClick({ source: job.source, itemIds: [...job.itemIds] }) === false) {
+          return failPending('Отправка отменена: не удалось сохранить статус перед Send.', job.jobId);
+        }
+      } catch (_) {
+        return failPending('Отправка отменена: не удалось сохранить статус перед Send.', job.jobId);
+      }
+      console.info(`[ChatGPT notifier] Нажимаю штатный Send (${job.source}).`);
       job.phase = 'confirm';
       job.clickedAt = Date.now();
       job.clickedSnapshotNormalized = normalizeComposerTextForOwnership(currentText);
@@ -545,7 +708,8 @@
 
     function handleResponseFinished() {
       if (pending || !items.length) return false;
-      const first = items[0];
+      const first = items.find(item => !item.persistent);
+      if (!first) return false;
       return beginSend({
         itemIds: [first.id],
         text: first.text,
@@ -555,21 +719,26 @@
       });
     }
 
-    function sendNow(id) {
+    function sendNow(id, options = {}) {
       const item = getItem(id);
-      if (!item) return false;
+      if (!item || (options.source === 'manual-persisted' && pending) ||
+          Boolean(item.persistent) !== (options.source === 'manual-persisted')) return false;
       return beginSend({
         itemIds: [item.id],
         text: item.text,
-        allowWhileGenerating: true,
-        source: 'manual-item',
-        timeoutMs: 3500
+        allowWhileGenerating: options.allowWhileGenerating ?? true,
+        source: options.source || 'manual-item',
+        minComposerDwellMs: options.minComposerDwellMs || 0,
+        timeoutMs: options.source === 'manual-persisted' &&
+          String(item.text).length >= LARGE_NATIVE_INSERT_THRESHOLD ? 90000 :
+          (options.source === 'manual-persisted' && options.minComposerDwellMs > 0
+            ? 6500 : 3500)
       });
     }
 
     function sendAllNow() {
-      if (!items.length) return false;
-      const snapshot = items.map(item => ({ ...item }));
+      const snapshot = getItems();
+      if (!snapshot.length) return false;
       return beginSend({
         itemIds: snapshot.map(item => item.id),
         text: snapshot.map(item => item.text).join('\n\n'),
@@ -579,6 +748,101 @@
       });
     }
 
+    // Exact live native draft reader: no newline / whitespace normalization.
+    function readNativeDraft() {
+      const editor = currentComposerContext()?.composer;
+      if (!editor || editor.isConnected === false || editor.disabled || editor.readOnly)
+        return null;
+      // ChatGPT's empty rich editor can render a structural newline:
+      // 5.7.11 already treated this as blank for insert-only.
+      if (isComposerVisiblyEmpty(editor)) return '';
+      const native = (typeof HTMLTextAreaElement !== 'undefined' &&
+        editor instanceof HTMLTextAreaElement) ||
+        (typeof HTMLInputElement !== 'undefined' && editor instanceof HTMLInputElement);
+      return native ? editor.value :
+        (typeof editor.innerText === 'string' ? editor.innerText : editor.textContent);
+    }
+
+    // Only APPEND to a populated composer, never replace it. Used by the file
+    // route to preserve an existing draft while adding the next task context.
+    async function appendOnly(suffix, expectedPrefix, { fileContext = false } = {}) {
+      const addition = String(suffix ?? '');
+      if (!addition.trim()) return { ok: false, reason: 'Нет текста для добавления.' };
+      if (insertingOnly || pending)
+        return { ok: false, reason: 'Другая передача уже выполняется.' };
+      const editor = currentComposerContext()?.composer;
+      if (!editor || editor.isConnected === false || editor.disabled || editor.readOnly)
+        return { ok: false, reason: 'Редактор ChatGPT недоступен.' };
+      const nativeBefore = readNativeDraft();
+      if (typeof expectedPrefix !== 'string' || nativeBefore !== expectedPrefix)
+        return { ok: false, reason: 'Штатный черновик изменился; текст не заменён.' };
+      if (!expectedPrefix) return insertOnly(addition, {fileContext});
+      const initialUrl = typeof location === 'undefined' ? '' : location.href;
+      insertingOnly = true;
+      try {
+        const expected = expectedPrefix + addition;
+        if (pending || editor.isConnected === false ||
+            currentComposerContext()?.composer !== editor ||
+            (initialUrl && typeof location !== 'undefined' && location.href !== initialUrl))
+          throw Error('Беседа или редактор изменились. Send не нажимался.');
+        if (!appendComposerChunk(editor, addition, false))
+          throw Error('Редактор не принял дополнение. Send не нажимался.');
+        if (!insertOnlyTextMatches(editor, expected, {fileContext}))
+          throw Error('После добавления черновик отличается посимвольно. Send не нажимался.');
+        return { ok: true, reason: 'Текст добавлен к штатному черновику без Send.' };
+      } catch (error) {
+        return { ok: false, reason: error?.message || 'Не удалось добавить текст.' };
+      } finally {
+        insertingOnly = false;
+      }
+    }
+
+    let insertingOnly = false;
+    function canInsertOnly() {
+      if (insertingOnly || pending) return false;
+      const editor = currentComposerContext()?.composer;
+      return Boolean(editor && editor.isConnected !== false &&
+        !editor.disabled && !editor.readOnly && isComposerVisiblyEmpty(editor));
+    }
+    async function insertOnly(text, { fileContext = false } = {}) {
+      const value = String(text ?? '');
+      if (!value.trim()) return {ok: false, reason: 'Нет текста для вставки.'};
+      if (insertingOnly || pending) return {ok: false, reason: 'Другая передача уже выполняется.'};
+      const current = currentComposerContext();
+      const editor = current?.composer;
+      if (!editor || editor.isConnected === false || editor.disabled || editor.readOnly)
+        return {ok: false, reason: 'Штатное поле ChatGPT недоступно.'};
+      if (!isComposerVisiblyEmpty(editor))
+        return {ok: false, reason: 'Штатное поле уже содержит текст. Ничего не заменено.'};
+      const initialUrl = typeof location === 'undefined' ? '' : location.href;
+      insertingOnly = true;
+      let accumulated = '';
+      try {
+        for (let offset = 0; offset < value.length;) {
+          if (pending || editor.isConnected === false ||
+              currentComposerContext()?.composer !== editor ||
+              (initialUrl && typeof location !== 'undefined' && location.href !== initialUrl))
+            throw Error('Вкладка или редактор изменились. Вставка остановлена, Send не нажимался.');
+          if (accumulated === '' ? !isComposerVisiblyEmpty(editor) :
+              !insertOnlyTextMatches(editor, accumulated, {fileContext}))
+            throw Error('Редактор изменил часть текста (пробелы, переносы или символы). Исходник сохранён; Send не нажимался.');
+          const end = nextInsertBoundary(value, offset);
+          if (!appendComposerChunk(editor, value.slice(offset, end), offset === 0))
+            throw Error('Редактор ChatGPT не принял часть текста. Send не нажимался.');
+          accumulated += value.slice(offset, end);
+          offset = end;
+          if (offset < value.length) await new Promise(resolve => setTimeout(resolve, 16));
+        }
+        if (!insertOnlyTextMatches(editor, value, {fileContext}))
+          throw Error('Вставка не совпала с исходником посимвольно. Исходник сохранён; Send не нажимался.');
+        return {ok: true, reason: 'Текст вставлен в ChatGPT без отправки. Проверяйте и редактируйте перед Send.'};
+      } catch (error) {
+        return {ok: false, reason: error?.message || 'Не удалось вставить текст.'};
+      } finally {
+        insertingOnly = false;
+      }
+    }
+
     function resetForNavigation() {
       clear();
     }
@@ -586,6 +850,7 @@
     return {
       add,
       addFromComposer,
+      insertOnly,
       move,
       moveRelative,
       remove,
@@ -596,9 +861,11 @@
       sendAllNow,
       resetForNavigation,
       getItems,
-      getCount: () => items.length,
-      hasQueued: () => items.length > 0,
+      getCount: () => getItems().length,
+      hasQueued: () => getItems().length > 0,
       isWaitingToSend: () => Boolean(pending),
+      isInsertingOnly: () => insertingOnly,
+      canInsertOnly, readNativeDraft, appendOnly,
       getPendingIds: () => pending ? [...pending.itemIds] : [],
       getLastStatus: () => lastStatus
     };
@@ -607,7 +874,8 @@
   return {
     readComposerText,
     setComposerText,
-    normalizeComposerTextForOwnership,
+    normalizeComposerTextForOwnership, fileContextTextMatches, nextInsertBoundary,
+    LARGE_NATIVE_INSERT_THRESHOLD, NATIVE_INSERT_CHUNK,
     shouldClearComposerTransfer,
     evaluateQueueSendConfirmation,
     createQueuedPromptController

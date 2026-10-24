@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.6.1';
+  const SCRIPT_VERSION = '5.7.32';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -23,8 +23,9 @@
     uploadActivityFallbackWindowMs: 90 * 1000
   });
 
-  const SYMBOLS = Object.freeze({ working: '⏳', fresh: '●', viewed: '✓', uploading: '⇧', idle: '' });
-  const ALL_PREFIX_SYMBOLS = Object.freeze(['⏳', '🔔', '✓', '📤', '●', '⇧']);
+  const SYMBOLS = Object.freeze({ working: '⏳', fresh: '●', viewed: '✓', uploading: '⇧', idle: '',
+    'observatory-working': '🔵', 'observatory-fresh': '🔷', 'observatory-viewed': '🔹' });
+  const ALL_PREFIX_SYMBOLS = Object.freeze(['⏳', '🔔', '✓', '📤', '●', '⇧', '🔵', '🔷', '🔹', '🟡', '🟣', '🟢', '🔴', '⏸', '◌']);
   const BROKEN_OLD_PREFIX_UNITS = new Set([0xDD14, 0xDCE4]);
 
   const STORAGE_KEY = 'chatgpt-tab-notifier-v5';

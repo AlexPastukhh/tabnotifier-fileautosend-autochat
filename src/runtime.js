@@ -9,16 +9,24 @@
     let uploadUi = null;
     let uploadController = null;
     let queuedPromptController = null;
+    let persistentMessageController = null;
+    let taskActivityMonitor = null;
+    let taskIntentMonitor = null;
+    let userMessageArchiveMonitor = null;
     let delayedSendController = null;
+    let observerBridge = null;
 
     function scheduleUi() {
       uploadUi?.schedule();
     }
 
-    const tabState = deps.createTabStateController({ scheduleUiUpdate: scheduleUi });
+    const completionModes = deps.createCompletionModeSettings?.() || null;
+    const tabState = deps.createTabStateController({ scheduleUiUpdate: scheduleUi,
+      isGenerating: () => (completionModes?.domEnabled() ?? true) && Boolean(deps.isGenerating?.()) });
     const notifications = deps.createNotificationService(tabState);
 
     const responseMonitor = deps.createResponseMonitor({
+      isDomEnabled: () => completionModes?.domEnabled() ?? true,
       tabState,
       notifications,
       beforeArm: () => {
@@ -30,6 +38,7 @@
           uploadController?.reset({ clearMark: true, render: false, clearFileHistory: true });
         }
       },
+      onArmed: () => observerBridge?.noteArmed(),
       onFinished: () => {
         delayedSendController?.check();
         if (!delayedSendController?.isSending?.() && !delayedSendController?.hasDueWork?.()) {
@@ -38,15 +47,81 @@
       }
     });
 
+    observerBridge = deps.createObservatoryCompletionBridge?.({
+      tabState, responseMonitor,
+      isEnabled: () => completionModes?.observatoryEnabled() ?? true
+    }) || null;
+
     uploadController = deps.createUploadAutoSendController({ tabState, isGenerationActive: deps.isGenerating });
-    queuedPromptController = deps.createQueuedPromptController({ onChange: scheduleUi });
+    queuedPromptController = deps.createQueuedPromptController({
+      onChange: scheduleUi,
+      beforeSendClick: info => persistentMessageController?.beforeSendClick(info) ?? true,
+      onSendResult: info => persistentMessageController?.handleSendResult(info)
+    });
+    persistentMessageController = deps.createPersistentMessageController?.({
+      queue: queuedPromptController, onChange: scheduleUi,
+      onSaved: () => { Promise.resolve().then(() => taskIntentMonitor?.check()); },
+      getConversationId: () => deps.currentChatId?.() || '',
+      getPairing: () => observerBridge?.getPairing?.() || null,
+      storage: deps.createGMRecordStorage?.({
+        getValue: typeof GM_getValue === 'function' ? GM_getValue : null,
+        setValue: typeof GM_setValue === 'function' ? GM_setValue : null,
+        listValues: typeof GM_listValues === 'function' ? GM_listValues : null
+      })
+    }) || null;
+    taskIntentMonitor = deps.createTaskIntentMonitor?.({
+      messages: persistentMessageController,
+      getPairing: () => observerBridge?.getPairing?.() || null,
+      getConversationId: () => deps.currentChatId?.() || '',
+      request: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null
+    }) || null;
+    taskActivityMonitor = deps.createTaskActivityMonitor?.({
+      messages: persistentMessageController,
+      getPairing: () => observerBridge?.getPairing?.() || null,
+      getConversationId: () => deps.currentChatId?.() || '',
+      request: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null,
+      onStatus: scheduleUi
+    }) || null;
+    userMessageArchiveMonitor = deps.createUserMessageArchiveMonitor?.({
+      messages: persistentMessageController,
+      getPairing: () => observerBridge?.getPairing?.() || null,
+      getConversationId: () => deps.currentChatId?.() || '',
+      request: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null
+    }) || null;
     delayedSendController = deps.createDelayedSendController({
       onChange: scheduleUi,
       isGenerationActive: deps.isGenerating,
       isSendPipelineBusy: () => Boolean(queuedPromptController?.isWaitingToSend() || uploadController?.isConfirmingSend()),
       getAssistantSnapshot: deps.assistantSnapshot
     });
-    uploadUi = deps.createUploadButtonUi({ tabState, uploadController, queuedPromptController, delayedSendController });
+    const textboxProfileManager = deps.createTextboxProfileManager?.({
+      getValue: typeof GM_getValue === 'function' ? GM_getValue : null,
+      setValue: typeof GM_setValue === 'function' ? GM_setValue : null,
+      onChange: scheduleUi
+    }) || null;
+
+    const sessionDispatchMonitor = deps.createSessionDispatchMonitor?.({
+      getPairing: () => observerBridge?.getPairing?.() || null,
+      getConversationId: () => deps.currentChatId?.() || '',
+      request: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null,
+      queue: queuedPromptController, messages: persistentMessageController,
+      profiles: textboxProfileManager,
+      quickAction: ({mode,text,moduleIds,profileId})=>
+        uploadUi?.dispatchQuickAction?.(mode,text,moduleIds,profileId) || {ok:false},
+      findComposerContext: deps.findComposerContext,
+      isGenerating: deps.isGenerating,
+      canExecute: context => !uploadController.isArmed() &&
+        !uploadController.isConfirmingSend() &&
+        !delayedSendController?.isSending?.() &&
+        !delayedSendController?.isCheckpointActive?.() &&
+        !queuedPromptController?.hasQueued?.() &&
+        !deps.composerHasUploadBusyEvidence?.(context.container || context.composer),
+      report: () => scheduleUi()
+    }) || null;
+    textboxProfileManager?.requestCatalog();
+    uploadUi = deps.createUploadButtonUi({ tabState, uploadController,
+      queuedPromptController, delayedSendController, persistentMessageController,
+      taskActivityMonitor, textboxProfileManager });
     let lastUrl = location.href;
 
     function recheckUploadSoon() {
@@ -82,8 +157,27 @@
       recheckUploadSoon();
     }, true);
 
+    function observeManualDraftSend() {
+      const context = deps.findComposerContext?.();
+      if (!context?.composer?.isConnected ||
+          !deps.isSendButtonReady?.(context.sendButton)) return;
+      const editor = context.composer;
+      const text = typeof HTMLTextAreaElement !== 'undefined' &&
+        editor instanceof HTMLTextAreaElement ? editor.value :
+        (typeof HTMLInputElement !== 'undefined' &&
+         editor instanceof HTMLInputElement ? editor.value :
+         (typeof editor.innerText === 'string' ? editor.innerText : editor.textContent));
+      if (typeof text !== 'string') return;
+      persistentMessageController?.recordManualDraftSend?.(text, {
+        fileNameVisible: name => Boolean(
+          deps.fileAttachmentVisible?.(context.container || editor, name) &&
+          !deps.composerHasUploadBusyEvidence?.(context.container || editor, [name]))
+      });
+    }
+
     document.addEventListener('click', event => {
       if (!deps.isComposerSendButton(event.target)) return;
+      if (event.isTrusted) observeManualDraftSend();
       responseMonitor.armAnswer('send-button');
     }, true);
 
@@ -92,6 +186,7 @@
         event.key === 'Enter' && !event.isComposing && !event.shiftKey && !event.ctrlKey &&
         !event.altKey && !event.metaKey && deps.isComposerTarget(event.target)
       ) {
+        if (event.isTrusted) observeManualDraftSend();
         responseMonitor.armAnswer('enter-key');
       }
     }, true);
@@ -99,6 +194,7 @@
     document.addEventListener('submit', event => {
       if (typeof HTMLFormElement === 'undefined' || !(event.target instanceof HTMLFormElement)) return;
       if (!deps.COMPOSER_SELECTORS.some(selector => event.target.querySelector(selector))) return;
+      if (event.isTrusted) observeManualDraftSend();
       responseMonitor.armAnswer('form-submit');
     }, true);
 
@@ -125,11 +221,13 @@
     function resetForNavigation() {
       lastUrl = location.href;
       responseMonitor.resetForNavigation();
+      observerBridge?.resetForNavigation();
       uploadController.reset({ clearMark: true, render: false });
       uploadController.resetFileHistory();
       queuedPromptController.resetForNavigation();
       delayedSendController?.resetForNavigation();
       uploadUi.closeQueuePanel?.();
+      uploadUi.resetLargePasteDraft?.();
       tabState.resetForNavigation();
       setTimeout(responseMonitor.check, 400);
     }
@@ -162,6 +260,10 @@
       delayedSendController?.check();
       queuedPromptController.attemptSend();
       tickCount += 1;
+      if (tickCount % 8 === 0) {
+        observerBridge?.check(); taskIntentMonitor?.check(); taskActivityMonitor?.check(); userMessageArchiveMonitor?.check();
+        sessionDispatchMonitor?.check();
+      }
       if (!document.hidden && tickCount % 6 === 0) scheduleUi();
     }, deps.SETTINGS.checkIntervalMs);
 
@@ -170,10 +272,24 @@
       GM_registerMenuCommand('◷ Чекпоинт по таймеру', delayedSendController.toggleCheckpoint);
       GM_registerMenuCommand('⇧ Автоотправка после загрузки файлов', uploadController.toggle);
       GM_registerMenuCommand('● Проверить уведомление', notifications.showDesktopNotification);
+      if (observerBridge) {
+        GM_registerMenuCommand('Fortis: привязать текущий чат', observerBridge.pairCurrent);
+        GM_registerMenuCommand('Fortis: отключить текущий чат', observerBridge.unpairCurrent);
+      }
+      if (completionModes) {
+        GM_registerMenuCommand('Fortis: переключить DOM (начало и конец)', completionModes.toggleDom);
+        GM_registerMenuCommand('Fortis: переключить Observatory (начало и конец)', completionModes.toggleObservatory);
+        GM_registerMenuCommand('Fortis: показать источники состояния', completionModes.showStatus);
+      }
     }
 
     tabState.render();
     responseMonitor.check();
+    observerBridge?.check();
+    taskIntentMonitor?.check();
+    taskActivityMonitor?.check();
+    userMessageArchiveMonitor?.check();
+    sessionDispatchMonitor?.check();
     scheduleUi();
     console.info(`[ChatGPT notifier] v${deps.SCRIPT_VERSION} запущен. Перетаскиваемые кнопки: ◷ — чекпоинт по таймеру, + — очередь/отложенные, ⇧ — автоотправка файлов.`);
 
@@ -181,10 +297,16 @@
       dispose() {
         clearInterval(interval);
         uiObserver.disconnect();
+        taskIntentMonitor?.dispose();
       },
       tabState,
       uploadController,
       queuedPromptController,
+      persistentMessageController,
+      taskActivityMonitor,
+      taskIntentMonitor,
+      userMessageArchiveMonitor,
+      sessionDispatchMonitor,
       delayedSendController,
       responseMonitor,
       uploadUi
