@@ -1,0 +1,56 @@
+{
+  "status": "candidate_only",
+  "source_release": "5.7.33",
+  "changes": [
+    {
+      "file": "package.json",
+      "sha256": "8252a7bfe5f293553e940eac4fb7eadcd53199aa4f409ac25d97e0c897012849",
+      "old_sha256": "6bb2b9e696fbeb175f0c91a7f4e74def22ed9e06e4ce55a52035161a741f0abd"
+    },
+    {
+      "file": "src/config.js",
+      "sha256": "a38945308edc3887d4cec839f66813039f7f339fef4d6df35836ab64eba57795",
+      "old_sha256": "34658bfc4c4f0422db8602300b1699f43c3af3c040831992c2118b96dd3e56c0"
+    },
+    {
+      "file": "src/runtime.js",
+      "sha256": "a27ddac46272ec1b317aaa032a40093de0ae70bafc44f47d64de314f9f206d6b",
+      "old_sha256": "3f51e3b5c304585ee7afabc5a2a98773dde57dcf46c9ca7e2a54d3c7d4b31ae0"
+    },
+    {
+      "file": "src/upload-button-ui.js",
+      "sha256": "c94f8bbb6f62cfd821f2da34428b9fadcea9995c4f682015034d5a07d0f9aac9",
+      "old_sha256": "1ca310672c4a51b0f5434c4480b257a8df97d868505a12dc48c77f8e0765e21d"
+    },
+    {
+      "file": "src/observatory-dispatch.js",
+      "sha256": "192ef9571477261953a12e07fb6de63d1a693f28a64be4ab03b752d7d0d1c986",
+      "old_sha256": "3e1ba6742b324884655f258d7512056e7cfed91287c29d98dc74bcba0ee5d297"
+    },
+    {
+      "file": "src/task-favicon.js",
+      "sha256": "02d02900cd67741829c77f01b9a6f676174f57683a52ea4cd2ae24f23abb7f39",
+      "old_sha256": "6fc2de33f0091877ede35c300a3434f930e8b710eaf5edcb146849efca1a274f"
+    },
+    {
+      "file": "src/title-utils.js",
+      "sha256": "ea8f06c9fb3c96d2c1b8140a1d80dbd6881b51ff116bf897a651cc8ca67557a5",
+      "old_sha256": "7d559ead694eebc245a1ea294c15799dfcc6f067c368696df98b2356313e11f5"
+    },
+    {
+      "file": "tests/upload-button-ui.test.mjs",
+      "sha256": "9e981df180ef947b6e706e625e3effbbbe16151055eae221a9755db0c4fa8170",
+      "old_sha256": "42eb8a87a57a3293affc0029aaa98db2efcd2c2dcfffe159a32a66658196948b"
+    },
+    {
+      "file": "tests/task-favicon.test.mjs",
+      "sha256": "c3a27ca5ec3833604867b7f1a4aef93be435501b69daf6131c43a27b61360249",
+      "old_sha256": "03eaabf163a6c1551c8634e8906459126a2e96734d4b5dcf82bde1b8a4879688"
+    },
+    {
+      "file": "chatgpt-tab-notifier.user.js",
+      "sha256": "3053624332a790534487bbdc5b94c5d885697deacaa79424ae99c59b40ef2218",
+      "old_sha256": "3cf14f4b1e43cd5a8f93aa3fe6e9828b3f523f9cb0c16674ea3a11f7af90c73e"
+    }
+  ]
+}
