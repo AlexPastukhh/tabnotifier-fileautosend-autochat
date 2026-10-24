@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.7.33';
+  const SCRIPT_VERSION = '5.7.34';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -32,6 +32,7 @@
   const CUSTOM_ICON_ID = 'chatgpt-tab-notifier-custom-icon';
   const UPLOAD_HOST_ID = 'chatgpt-tab-notifier-upload-host';
   const FLOATING_UI_POSITION_KEY = 'chatgpt-tab-notifier-floating-ui-position-v1';
+  const FLOATING_UI_LAYOUT_KEY = 'chatgpt-tab-notifier-floating-ui-layout-v1';
 
   const COMPOSER_SELECTORS = Object.freeze([
     '#prompt-textarea[contenteditable="true"]',
@@ -90,6 +91,7 @@
     CUSTOM_ICON_ID,
     UPLOAD_HOST_ID,
     FLOATING_UI_POSITION_KEY,
+    FLOATING_UI_LAYOUT_KEY,
     COMPOSER_SELECTORS,
     SEND_BUTTON_SELECTORS,
     UPLOAD_BUSY_SELECTORS,

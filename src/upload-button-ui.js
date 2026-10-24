@@ -8,8 +8,8 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function (deps) {
   'use strict';
 
-  // The original three actions retain their click handlers and 34px targets; settings is a fourth button.
-  // The always-visible textbox to their right shares one draggable host.
+  // Controls and the collapsible, resizable textbox share one draggable host.
+  // Layout preferences never contain message text or trigger a preparation/Send.
   const UI_WIDTH = 422;
   const UI_HEIGHT = 88;
   const VIEWPORT_MARGIN = 6;
@@ -330,15 +330,38 @@
       !event.isComposing && event.keyCode !== 229 && !event.repeat;
   }
 
+  function normalizeFloatingLayout(value) {
+    const number = (input, fallback, min, max) => Number.isFinite(input)
+      ? Math.min(max, Math.max(min, Math.round(input))) : fallback;
+    return {version:1,
+      width:number(value?.width, UI_WIDTH, 360, 1200),
+      height:number(value?.height, 112, 112, 800),
+      collapsed:value?.collapsed === true};
+  }
+
+  function floatingDimensions(layout, viewportWidth, viewportHeight) {
+    const prefs = normalizeFloatingLayout(layout);
+    const availableWidth = Math.max(1, viewportWidth - 2 * VIEWPORT_MARGIN);
+    const width = Math.min(prefs.collapsed ? 154 : prefs.width, availableWidth);
+    const compact = !prefs.collapsed && width < 360;
+    const controlsHeight = compact ? 89 : 0;
+    const textboxHeight = Math.min(prefs.height,
+      Math.max(1, viewportHeight - 2 * VIEWPORT_MARGIN - controlsHeight));
+    return {width, height:prefs.collapsed ? UI_HEIGHT :
+      Math.max(UI_HEIGHT, textboxHeight + controlsHeight), textboxHeight, compact};
+  }
+
   function canStartFloatingDrag(target) {
     // Only the old three buttons or the new dedicated drag grip.
     // A textarea and Send button must keep their normal text/click gestures.
     return target?.closest?.('.control, .quick-grip') != null;
   }
 
-  function clampFloatingPosition(position, viewportWidth, viewportHeight) {
-    const maxLeft = Math.max(VIEWPORT_MARGIN, viewportWidth - floatingWidth(viewportWidth) - VIEWPORT_MARGIN);
-    const maxTop = Math.max(VIEWPORT_MARGIN, viewportHeight - UI_HEIGHT - VIEWPORT_MARGIN);
+  function clampFloatingPosition(position, viewportWidth, viewportHeight, dimensions = null) {
+    const width = dimensions?.width ?? floatingWidth(viewportWidth);
+    const height = dimensions?.height ?? UI_HEIGHT;
+    const maxLeft = Math.max(VIEWPORT_MARGIN, viewportWidth - width - VIEWPORT_MARGIN);
+    const maxTop = Math.max(VIEWPORT_MARGIN, viewportHeight - height - VIEWPORT_MARGIN);
     return {
       left: Math.min(Math.max(VIEWPORT_MARGIN, Number(position?.left) || VIEWPORT_MARGIN), maxLeft),
       top: Math.min(Math.max(VIEWPORT_MARGIN, Number(position?.top) || VIEWPORT_MARGIN), maxTop)
@@ -363,6 +386,7 @@
     let suppressClickUntil = 0;
     let dragState = null;
     let draggedItemId = null;
+    let quickLayout = loadQuickLayout();
     let persistedVisibleCount = 20;
     let persistedVisibleChat = null;
     const largePaste = createLargePasteDraft();
@@ -408,10 +432,53 @@
       catch (_) {}
     }
 
+    function loadQuickLayout() {
+      try {
+        return normalizeFloatingLayout(JSON.parse(
+          localStorage.getItem(deps.FLOATING_UI_LAYOUT_KEY) || 'null'));
+      } catch (_) { return normalizeFloatingLayout(null); }
+    }
+
+    function saveQuickLayout() {
+      try { localStorage.setItem(deps.FLOATING_UI_LAYOUT_KEY, JSON.stringify(quickLayout)); }
+      catch (_) { /* A blocked preference store must never affect the draft. */ }
+    }
+
+    function positionFeedback(ui) {
+      if (!ui?.quickFeedback || ui.quickFeedback.hidden) return;
+      const viewport = viewportSize(), hostRect = ui.host.getBoundingClientRect();
+      const tip = ui.quickFeedback.getBoundingClientRect();
+      const wantedTop = viewport.height - hostRect.bottom >= tip.height + 8
+        ? hostRect.bottom + 8 : hostRect.top - tip.height - 8;
+      const top = Math.max(VIEWPORT_MARGIN,
+        Math.min(wantedTop, viewport.height - tip.height - VIEWPORT_MARGIN));
+      const left = Math.max(VIEWPORT_MARGIN,
+        Math.min(hostRect.right - tip.width, viewport.width - tip.width - VIEWPORT_MARGIN));
+      ui.quickFeedback.style.top = (top - hostRect.top) + 'px';
+      ui.quickFeedback.style.left = (left - hostRect.left) + 'px';
+    }
+
     function setHostPosition(host, position, { persist = false } = {}) {
       const viewport = viewportSize();
-      const next = clampFloatingPosition(position, viewport.width, viewport.height);
-      host.style.width = floatingWidth(viewport.width) + 'px';
+      const dimensions = floatingDimensions(quickLayout, viewport.width, viewport.height);
+      const next = clampFloatingPosition(position, viewport.width, viewport.height, dimensions);
+      host.style.width = dimensions.width + 'px';
+      host.style.height = dimensions.height + 'px';
+      host.style.setProperty('--quick-height', dimensions.textboxHeight + 'px');
+      host.dataset.textboxCompact = String(dimensions.compact);
+      host.dataset.textboxCollapsed = String(quickLayout.collapsed);
+      const compose = host.shadowRoot?.querySelector('.quick-compose');
+      const toggle = host.shadowRoot?.querySelector('.textbox-toggle');
+      if (compose) compose.hidden = quickLayout.collapsed;
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', String(!quickLayout.collapsed));
+        toggle.title = quickLayout.collapsed ? 'Развернуть текстбокс' : 'Свернуть текстбокс';
+        toggle.setAttribute('aria-label', toggle.title);
+        toggle.textContent = quickLayout.collapsed ? '›' : '‹';
+      }
+      host.shadowRoot?.querySelector('.quick-resize')?.setAttribute('aria-label',
+        'Изменить размер текстбокса: ' + Math.round(dimensions.width) + ' × ' +
+        Math.round(dimensions.textboxHeight) + '. Перетащите угол или используйте стрелки.');
       host.style.left = `${Math.round(next.left)}px`;
       host.style.top = `${Math.round(next.top)}px`;
       if (persist) savePosition(next);
@@ -452,10 +519,10 @@
 
       if (hostRect.top >= panelHeight + 12) {
         panel.style.top = 'auto';
-        panel.style.bottom = (UI_HEIGHT + 10) + 'px';
+        panel.style.bottom = (hostRect.height + 10) + 'px';
       } else {
         panel.style.bottom = 'auto';
-        panel.style.top = (UI_HEIGHT + 10) + 'px';
+        panel.style.top = (hostRect.height + 10) + 'px';
       }
     }
 
@@ -723,7 +790,10 @@
           host.shadowRoot.querySelector('.quick-expand') &&
           host.shadowRoot.querySelector('.quick-file') &&
           host.shadowRoot.querySelector('.quick-insert') &&
-          host.shadowRoot.querySelector('.settings-button')) {
+          host.shadowRoot.querySelector('.settings-button') &&
+          host.shadowRoot.querySelector('.textbox-toggle') &&
+          host.shadowRoot.querySelector('.quick-resize') &&
+          host.shadowRoot.querySelector('.quick-feedback-close')) {
         return {
           host,
           row: host.shadowRoot.querySelector('.row'),
@@ -735,6 +805,10 @@
           quickFile: host.shadowRoot.querySelector('.quick-file'),
           quickInsert: host.shadowRoot.querySelector('.quick-insert'),
           quickFeedback: host.shadowRoot.querySelector('.quick-feedback'),
+          quickFeedbackText: host.shadowRoot.querySelector('.quick-feedback-text'),
+          quickFeedbackClose: host.shadowRoot.querySelector('.quick-feedback-close'),
+          textboxToggle: host.shadowRoot.querySelector('.textbox-toggle'),
+          quickResize: host.shadowRoot.querySelector('.quick-resize'),
           settingsUi: host.__fortisTextboxSettings || null,
           delayButton: host.shadowRoot.querySelector('[data-role="delay-send"]'),
           queueButton: host.shadowRoot.querySelector('[data-role="queue"]'),
@@ -794,12 +868,21 @@
             -webkit-user-select:none; user-select:none;
           }
           .quick-compose {
-            flex:1 1 0; min-width:0; height:68px; padding:5px 6px 5px 3px;
+            flex:1 1 0; min-width:0; height:var(--quick-height,112px); padding:5px 6px 14px 3px; position:relative; overflow:auto;
             display:flex; align-items:stretch; gap:4px;
             border:1px solid rgba(128,128,128,.36); border-radius:12px;
             background:rgba(30,30,30,.96); cursor:default;
             box-shadow:0 3px 14px rgba(0,0,0,.30);
           }
+          .quick-compose[hidden] { display:none; }
+          :host([data-textbox-compact="true"]) .row { flex-wrap:wrap; align-content:flex-start; }
+          :host([data-textbox-compact="true"]) .quick-compose { flex:0 0 100%; }
+          .textbox-toggle { font-size:25px; font-weight:400; }
+          .quick-resize { position:absolute; right:1px; bottom:1px; width:16px; height:16px;
+            padding:0; border:0; border-radius:3px; color:#b9b9b9; background:transparent;
+            font:14px/1 system-ui,sans-serif; cursor:nwse-resize; touch-action:none; }
+          .quick-resize:hover,.quick-resize:focus-visible { color:#fff; background:#ffffff1c; }
+          .control:focus-visible,.quick-feedback-close:focus-visible { outline:2px solid #b9cfff; outline-offset:2px; }
           .control, .quick-grip { touch-action:none; }
           .quick-grip {
             width:14px; flex:0 0 14px; align-self:stretch; display:flex;
@@ -825,26 +908,31 @@
           }
           .quick-copy[hidden], .quick-clear[hidden], .quick-expand[hidden] { display:none; }
           .quick-actions {
-            width:45px;flex:0 0 45px;display:flex;flex-direction:column;
-            justify-content:space-between;align-items:stretch;gap:3px;
+            width:92px;flex:0 0 92px;display:flex;flex-direction:column;
+            justify-content:center;align-items:stretch;gap:3px;
           }
-          .quick-file, .quick-insert {width:45px;flex:0 0 26px;height:26px;font-size:10px;}
+          .quick-file, .quick-insert {width:92px;flex:0 0 26px;height:26px;font:600 11px/1.2 system-ui,sans-serif;white-space:nowrap;}
           .quick-send {
-            flex:0 0 30px; width:45px; align-self:stretch; height:30px; padding:0;
+            flex:0 0 28px; width:92px; align-self:stretch; height:28px; padding:0 6px; white-space:nowrap;
             border:1px solid rgba(112,183,144,.58); border-radius:9px;
             background:rgba(40,77,59,.98); color:#fff; cursor:pointer;
-            font:18px/1 system-ui,sans-serif; touch-action:auto;
+            font:600 11px/1.2 system-ui,sans-serif; touch-action:auto;
           }
           .quick-send:hover:not(:disabled) { background:rgba(58,100,78,.98); }
           .quick-send:disabled { opacity:.45; cursor:default; }
           .quick-feedback {
-            position:absolute; top:91px; right:0;
-            max-width:min(330px, calc(100vw - 24px)); padding:5px 8px;
+            position:absolute; top:calc(100% + 8px); right:auto; z-index:10;
+            width:max-content; max-width:min(360px, calc(100vw - 12px)); max-height:min(240px,calc(100vh - 24px));
+            overflow:auto; overflow-wrap:anywhere; padding:8px 32px 8px 10px;
             border:1px solid rgba(128,128,128,.35); border-radius:8px;
             background:rgba(30,30,30,.96); color:#d9f0e0;
             font:11px/1.3 system-ui,sans-serif; user-select:text; cursor:default;
-            pointer-events:none;
+            pointer-events:auto;
           }
+          .quick-feedback-close {position:absolute;right:4px;top:4px;width:24px;height:24px;
+            border:0;border-radius:5px;padding:0;background:transparent;color:#d9f0e0;
+            cursor:pointer;font:19px/1 system-ui,sans-serif;}
+          .quick-feedback-close:hover {background:#ffffff18;}
           .quick-feedback[hidden] { display:none; }
           .control:hover { filter:brightness(1.12); }
           .control[data-active="true"] { opacity:1; }
@@ -1044,8 +1132,9 @@
           <span class="meta-chip version-chip"></span>
           <button type="button" class="control" data-role="delay-send" aria-label="Чекпоинт по таймеру">◷</button>
           <button type="button" class="control" data-role="queue" aria-label="Очередь сообщений">+</button>
+          <button type="button" class="control textbox-toggle" data-role="textbox-toggle" aria-label="Свернуть текстбокс" aria-controls="fortis-quick-compose" aria-expanded="true" title="Свернуть текстбокс">‹</button>
           <button type="button" class="control" data-role="auto-send" aria-label="Автоотправить после загрузки файлов">⇧</button>
-          <div class="quick-compose" role="group" aria-label="Fortis Textbox — ввод сообщения">
+          <div class="quick-compose" role="group" aria-label="Fortis Textbox — ввод сообщения" id="fortis-quick-compose">
             <span class="quick-grip" title="Перетащить четыре кнопки вместе с текстбоксом" aria-label="Переместить панель">⠿</span>
             <textarea class="quick-input" rows="2" aria-label="Новое сообщение Fortis Textbox" placeholder="Сообщение..."></textarea>
             <button type="button" class="quick-expand" hidden aria-label="Развернуть и редактировать большой промпт целиком" title="Показать весь текст для редактирования">↗</button>
@@ -1057,8 +1146,9 @@
               <button type="button" class="quick-send" aria-label="Нажать Send для подготовленного сообщения"
                 title="Одна попытка Send только после кнопок Файл или Вставить">Нажать Send</button>
             </div>
+            <button type="button" class="quick-resize" title="Изменить размер · стрелки: 16 px, Shift: 48 px" aria-label="Изменить размер текстбокса">◢</button>
           </div>
-          <span class="quick-feedback" role="status" aria-live="polite" hidden></span>
+          <div class="quick-feedback" role="status" aria-live="polite" hidden><span class="quick-feedback-text"></span><button type="button" class="quick-feedback-close" aria-label="Закрыть уведомление" title="Закрыть уведомление">×</button></div>
           <span class="badge"></span>
         </div>`;
 
@@ -1073,6 +1163,10 @@
         quickFile: shadow.querySelector('.quick-file'),
         quickInsert: shadow.querySelector('.quick-insert'),
         quickFeedback: shadow.querySelector('.quick-feedback'),
+        quickFeedbackText: shadow.querySelector('.quick-feedback-text'),
+        quickFeedbackClose: shadow.querySelector('.quick-feedback-close'),
+        textboxToggle: shadow.querySelector('.textbox-toggle'),
+        quickResize: shadow.querySelector('.quick-resize'),
         delayButton: shadow.querySelector('[data-role="delay-send"]'),
         queueButton: shadow.querySelector('[data-role="queue"]'),
         autoButton: shadow.querySelector('[data-role="auto-send"]'),
@@ -1184,6 +1278,72 @@
       ui.row.addEventListener('pointerup', finishDrag);
       ui.row.addEventListener('pointercancel', finishDrag);
 
+      function applyLayout() {
+        const rect = host.getBoundingClientRect();
+        setHostPosition(host, {left:rect.left, top:rect.top});
+        positionPanel(host, ui.panel);
+        positionPanel(host, ui.settingsUi?.panel);
+        positionFeedback(ui);
+      }
+
+      ui.textboxToggle.addEventListener('click', event => {
+        if (clickWasDrag(event)) return;
+        event.preventDefault(); event.stopPropagation();
+        quickLayout = {...quickLayout, collapsed:!quickLayout.collapsed};
+        saveQuickLayout(); applyLayout();
+      });
+      function dismissFeedback(event) {
+        event.preventDefault(); event.stopPropagation();
+        ui.quickFeedback.hidden = true;
+        (quickLayout.collapsed ? ui.textboxToggle : ui.quickInput).focus();
+      }
+      ui.quickFeedbackClose.addEventListener('click', dismissFeedback);
+      ui.quickFeedback.addEventListener('keydown', event => {
+        if (event.key === 'Escape') dismissFeedback(event);
+      });
+
+      let resizeState = null;
+      ui.quickResize.addEventListener('pointerdown', event => {
+        if (event.button !== 0 || event.isPrimary === false) return;
+        event.preventDefault(); event.stopPropagation();
+        const rect = host.getBoundingClientRect();
+        resizeState = {pointerId:event.pointerId, x:event.clientX, y:event.clientY,
+          width:rect.width, height:parseFloat(host.style.getPropertyValue('--quick-height')),
+          original:{...quickLayout}, left:rect.left, top:rect.top};
+        ui.quickResize.setPointerCapture?.(event.pointerId);
+      });
+      ui.quickResize.addEventListener('pointermove', event => {
+        if (!resizeState || resizeState.pointerId !== event.pointerId) return;
+        event.preventDefault(); event.stopPropagation();
+        quickLayout = normalizeFloatingLayout({...quickLayout,
+          width:resizeState.width + event.clientX - resizeState.x,
+          height:resizeState.height + event.clientY - resizeState.y});
+        setHostPosition(host, {left:resizeState.left, top:resizeState.top});
+        positionFeedback(ui);
+      });
+      function finishResize(event) {
+        if (!resizeState || resizeState.pointerId !== event.pointerId) return;
+        event.preventDefault(); event.stopPropagation();
+        if (event.type === 'pointercancel') quickLayout = resizeState.original;
+        resizeState = null;
+        try { ui.quickResize.releasePointerCapture?.(event.pointerId); } catch (_) {}
+        saveQuickLayout(); applyLayout();
+        const rect = host.getBoundingClientRect();
+        savePosition({left:rect.left, top:rect.top});
+      }
+      ui.quickResize.addEventListener('pointerup', finishResize);
+      ui.quickResize.addEventListener('pointercancel', finishResize);
+      ui.quickResize.addEventListener('keydown', event => {
+        const direction = {ArrowLeft:[-1,0], ArrowRight:[1,0], ArrowUp:[0,-1], ArrowDown:[0,1]}[event.key];
+        if (!direction) return;
+        event.preventDefault(); event.stopPropagation();
+        const step = event.shiftKey ? 48 : 16;
+        quickLayout = normalizeFloatingLayout({...quickLayout,
+          width:quickLayout.width + direction[0] * step,
+          height:quickLayout.height + direction[1] * step});
+        saveQuickLayout(); applyLayout();
+      });
+
       ui.queueButton.addEventListener('click', event => {
         if (clickWasDrag(event)) return;
         event.preventDefault();
@@ -1251,7 +1411,7 @@
         ui.quickClear.hidden = true;
         ui.quickCopy.hidden = true;
         ui.quickExpand.hidden = true;
-        ui.quickFeedback.textContent = '';
+        ui.quickFeedbackText.textContent = '';
         ui.quickFeedback.hidden = true;
         if (focus) ui.quickInput.focus();
       }
@@ -1267,19 +1427,19 @@
         ui.quickExpand.hidden = true;
         ui.quickCopy.hidden = true;
         ui.quickClear.hidden = true;
-        ui.quickFeedback.textContent = 'Показан полный исходник — можно редактировать перед отправкой.';
-        ui.quickFeedback.hidden = false;
+        ui.quickFeedbackText.textContent = 'Показан полный исходник — можно редактировать перед отправкой.';
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
         ui.quickInput.focus();
       });
       ui.quickCopy.addEventListener('click', async () => {
         if (!largePaste.active()) return;
         try {
           await navigator.clipboard.writeText(largePaste.text(''));
-          ui.quickFeedback.textContent = 'Полный большой промпт скопирован.';
+          ui.quickFeedbackText.textContent = 'Полный большой промпт скопирован.';
         } catch (_) {
-          ui.quickFeedback.textContent = 'Не удалось скопировать. Исходный текст остаётся в памяти вкладки.';
+          ui.quickFeedbackText.textContent = 'Не удалось скопировать. Исходный текст остаётся в памяти вкладки.';
         }
-        ui.quickFeedback.hidden = false;
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
       });
       ui.quickInput.addEventListener('paste', event => {
         if (event.clipboardData?.files?.length || largePaste.active()) return;
@@ -1293,8 +1453,8 @@
         ui.quickClear.hidden = false;
         ui.quickCopy.hidden = false;
         ui.quickExpand.hidden = false;
-        ui.quickFeedback.textContent = 'Полный текст сохранён в памяти до отправки; при обновлении вкладки пропадёт.';
-        ui.quickFeedback.hidden = false;
+        ui.quickFeedbackText.textContent = 'Полный текст сохранён в памяти до отправки; при обновлении вкладки пропадёт.';
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
       });
 
       let fileTransferPending = false;
@@ -1310,8 +1470,8 @@
       let lastFileStatus = '';
       const fileStatus = message => {
         lastFileStatus = String(message || '');
-        ui.quickFeedback.textContent = lastFileStatus;
-        ui.quickFeedback.hidden = false;
+        ui.quickFeedbackText.textContent = lastFileStatus;
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
       };
 
       function currentFileContext(chatId) {
@@ -1536,8 +1696,8 @@
         if (ui.quickInsert.disabled || fileTransferPending) return {ok:false};
         original=String(original);
         if (!original.trim()) {
-          ui.quickFeedback.textContent = 'Сначала вставьте текст.';
-          ui.quickFeedback.hidden = false;
+          ui.quickFeedbackText.textContent = 'Сначала вставьте текст.';
+          ui.quickFeedback.hidden = false; positionFeedback(ui);
           return;
         }
         if (original.length >= LARGE_PASTE_THRESHOLD) {
@@ -1549,33 +1709,33 @@
         ui.quickInsert.disabled = true;
         ui.quickSend.disabled = true;
         ui.quickFile.disabled = true;
-        ui.quickFeedback.textContent = 'Подготавливаю модули и Fortis task context без Send…';
-        ui.quickFeedback.hidden = false;
+        ui.quickFeedbackText.textContent = 'Подготавливаю модули и Fortis task context без Send…';
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
         try {
           const profile = prepareActiveModules(original,moduleIds,profileId);
           const record = persistentMessageController.prepareDraft(original, {
             mode: 'insert', extraText: profile.extraText
           });
           if (!record) {
-            ui.quickFeedback.textContent =
+            ui.quickFeedbackText.textContent =
               persistentMessageController.getLastStatus?.() || 'Черновик не сохранён.';
             return {ok:false,reason:'prepared_missing'};
           }
           if (record.submitted_text.length >= LARGE_PASTE_THRESHOLD) {
-            ui.quickFeedback.textContent =
+            ui.quickFeedbackText.textContent =
               'Черновик с модулями слишком длинный. Исходник сохранён; ' +
               'Send не нажат. Используйте «Файл».';
             return;
           }
           const result = await queuedPromptController.insertOnly(record.submitted_text);
           const success=Boolean(result?.ok);
-          ui.quickFeedback.textContent = result.ok
+          ui.quickFeedbackText.textContent = result.ok
             ? 'Текст, модули и Fortis task context вставлены; task_id сохранён. ' +
               'Отправь ВРУЧНУЮ.'
             : result.reason;
           return success ? {ok:true,taskId:record.task_id} : {ok:false,reason:'context_mismatch'};
         } catch (error) {
-          ui.quickFeedback.textContent = error?.message || 'Модули недоступны.';
+          ui.quickFeedbackText.textContent = error?.message || 'Модули недоступны.';
         } finally {
           ui.quickInsert.disabled = false;
           ui.quickSend.disabled = false;
@@ -1596,10 +1756,10 @@
         const originalText = originalOverride === null
           ? largePaste.text(ui.quickInput.value) : String(originalOverride);
         if (new TextEncoder().encode(originalText).length > MAX_QUICK_SEND_BYTES) {
-          ui.quickFeedback.textContent =
+          ui.quickFeedbackText.textContent =
             'Этот текст превышает предел 512 КиБ для сохранения точного оригинала Observatory. ' +
             'Отправка отменена; промпт остался в поле/памяти.';
-          ui.quickFeedback.hidden = false;
+          ui.quickFeedback.hidden = false; positionFeedback(ui);
           return;
         }
         let options={minComposerDwellMs:1000,focusAfterSend:true};
@@ -1614,8 +1774,8 @@
               extraText:prepared.extraText,focusAfterSend:prepared.focusAfterSend};
           }
         }catch(error){
-          ui.quickFeedback.textContent=error?.message||'Модули недоступны';
-          ui.quickFeedback.hidden=false;return;
+          ui.quickFeedbackText.textContent=error?.message||'Модули недоступны';
+          ui.quickFeedback.hidden = false; positionFeedback(ui);return;
         }
         // A short original may expand beyond safe rich-editor size after
         // Planning Helper modules. Auto-route the EXPLICIT quick Send through
@@ -1624,8 +1784,8 @@
            originalText.length + String(options.extraText||'').length >= LARGE_PASTE_THRESHOLD) {
           const existing=queuedPromptController?.readNativeDraft?.();
           if(typeof existing!=='string'||existing.trim()){
-            ui.quickFeedback.textContent='Редактор уже содержит текст; отправка через файл отменена.';
-            ui.quickFeedback.hidden=false;
+            ui.quickFeedbackText.textContent='Редактор уже содержит текст; отправка через файл отменена.';
+            ui.quickFeedback.hidden = false; positionFeedback(ui);
             return {ok:false,reason:'native_draft_occupied'};
           }
           void (async()=>{
@@ -1634,17 +1794,17 @@
             const result=sendPreparedNative(prepared.taskId);
             if(result?.ok){
               largePaste.clear();ui.quickInput.value='';
-              ui.quickFeedback.textContent='Файл отправлен через штатную кнопку; приём ChatGPT не подтверждён.';
-              ui.quickFeedback.hidden=false;
+              ui.quickFeedbackText.textContent='Файл отправлен через штатную кнопку; приём ChatGPT не подтверждён.';
+              ui.quickFeedback.hidden = false; positionFeedback(ui);
             }
           })();
           return;
         }
         const id = persistentMessageController?.saveAndSend(originalText,options);
-        ui.quickFeedback.textContent = id
+        ui.quickFeedbackText.textContent = id
           ? 'Исходник сохранён; передаю в ChatGPT, Send примерно через 1 сек.'
           : (persistentMessageController?.getLastStatus?.() || 'Отправка не подготовлена.');
-        ui.quickFeedback.hidden = false;
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
         window.setTimeout(() => { ui.quickFeedback.hidden = true; }, 4500);
         if (!id) return {ok:false};
         if (originalOverride !== null) return {ok:true,taskId:id};
@@ -1735,16 +1895,16 @@
       }
       ui.quickSend.addEventListener('click',()=>{
         const result=sendPreparedNative();
-        ui.quickFeedback.textContent=result?.ok
+        ui.quickFeedbackText.textContent=result?.ok
           ? 'Одна попытка штатного Send; приём ChatGPT не подтверждён. Оригинал в локальной истории.'
           : 'Send не нажат: '+(result?.reason||'не удалось подтвердить подготовку');
-        ui.quickFeedback.hidden=false;
+        ui.quickFeedback.hidden = false; positionFeedback(ui);
         if(result?.ok&&quickPrepared?.id===result.taskId&&
            quickPrepared.chat===deps.currentChatId?.()&&
            largePaste.text(ui.quickInput.value)===quickPrepared.original){
           clearLargePaste({focus:false});
-          ui.quickFeedback.hidden=false;
-          ui.quickFeedback.textContent='Send нажат один раз; текст сохранён в истории. Приём ChatGPT не подтверждён.';
+          ui.quickFeedback.hidden = false; positionFeedback(ui);
+          ui.quickFeedbackText.textContent='Send нажат один раз; текст сохранён в истории. Приём ChatGPT не подтверждён.';
         }
         if(result?.ok)quickPrepared=null;
       });
@@ -1821,6 +1981,7 @@
       positionPanel(host, ui.panel);
       positionPanel(host, ui.settingsUi?.panel);
       ui.settingsUi?.render();
+      positionFeedback(ui);
     }
 
     function schedule() {
@@ -1847,7 +2008,7 @@
     return { render, schedule, closeQueuePanel, resetLargePasteDraft, dispatchQuickAction };
   }
 
-  return { clampFloatingPosition, floatingWidth, canStartFloatingDrag,
+  return { clampFloatingPosition, floatingWidth, normalizeFloatingLayout, floatingDimensions, canStartFloatingDrag,
     shouldSendQuickTextboxKey, pagePersistedHistory, createLargePasteDraft,
     LARGE_PASTE_THRESHOLD, MAX_QUICK_SEND_BYTES, MAX_FILE_PROMPT_BYTES,
     createPromptTextFile, isEligiblePromptFileInput, tryPromptFileInputOnce,

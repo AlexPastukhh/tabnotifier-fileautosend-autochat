@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-tab-notifier",
-  "version": "5.7.33",
+  "version": "5.7.34",
   "private": true,
   "scripts": {
     "build": "node build-userscript.mjs",
