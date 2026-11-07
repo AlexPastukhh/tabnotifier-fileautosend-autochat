@@ -1,8 +1,30 @@
 # ChatGPT Tab Notifier / File Auto-Send / Prompt Queue
 
-## Текущая версия и связь с Observatory — 25.10.2026
+## 31.10.2026 — Notifier 5.7.35: закрепление положения панели (SOURCE READY)
 
-Основной `chatgpt-tab-notifier.user.js` и версионный `chatgpt-tab-notifier-5.7.34.user.js` сейчас содержат 5.7.34 (релизный коммит `12738fd`), SHA-256 `4e3409b92284f451ae5a5e75c72c5218f08ee6059d7c7692d8bf2e2604881319`. Это состояние source/bundle; установленная копия в каждом профиле проверяется отдельно по runtime badge. Ниже сохранена история: утверждение о main 5.7.32 относится к его выпуску и заменено этой сводкой.
+При каждом render() старая версия заново читала координаты из localStorage
+и сохраняла уже ограниченную текущим viewport позицию. Узкое окно,
+изменение высоты/ширины текстбокса и параллельные вкладки могли сдвинуть
+сохранённые координаты. Теперь предпочтительная позиция загружается
+один раз при старте каждой вкладки и записывается только при первом
+размещении или завершении явного перетаскивания. Рендер, сжатие окна,
+сворачивание и resize сохраняют предпочтение; во время drag refresh
+не возвращает блок к старым координатам. Layout/GM-данные, архив,
+команды File/Insert/Send, очередь и Observatory API не менялись.
+
+Источник и собранный userscript: 5.7.35, основной и версионный
+chatgpt-tab-notifier-5.7.35.user.js совпадают, SHA-256:
+0fe6977802cadf9c51d707af2a62ae870bcd29f9b0256291556a9919f739d2fe.
+Node 288 PASS / 1 SKIP (289 тестов), build:check PASS. Реальный Edge/Tampermonkey smoke НЕ
+проводился, Windows Loader и установленная копия НЕ обновлены.
+Обновлять только существующий Loader с сохранением его имени,
+namespace, grants, GM-данных и черновика; вторую копию не включать.
+Версия в целевом профиле проверяется по runtime badge после обновления.
+
+
+## Исторический срез версии и связи с Observatory — 25.10.2026
+
+На 25.10.2026 основной `chatgpt-tab-notifier.user.js` и версионный `chatgpt-tab-notifier-5.7.34.user.js` содержали 5.7.34 (релизный коммит `12738fd`), SHA-256 `4e3409b92284f451ae5a5e75c72c5218f08ee6059d7c7692d8bf2e2604881319`. Это состояние source/bundle; установленная копия в каждом профиле проверяется отдельно по runtime badge. Ниже сохранена история: утверждение о main 5.7.32 относится к его выпуску и заменено этой сводкой.
 
 В текущих 5.7.33/5.7.34 owner-dispatch `mode=send` проходит через `handleQuickFile` и одну попытку `sendPreparedNative`; это File + Send, включая короткий текстовый указатель рядом с TXT-вложением. В старом Notifier тот же режим мог отправить короткий исходник обычным текстом. Согласование версии/capabilities клиента в протоколе пока отсутствует. Проверять реальную версию нужно в целевой вкладке/профиле, а не только в Repo или заголовке Loader.
 
@@ -1449,3 +1471,16 @@ smoke пока НЕ ПРОВЕРЕНЫ (Loader находится в базе р
 Полная схема и проверка: `candidates/full-file-5.7.32/README.md`.
 Source backup до изменения: `/workspace/repo/fortis-notifier-pre-full-file-5.7.32-20261024`.
 Основной и версионный SHA-256: `a4626ae6d53570a0c6a14d8c058a3ceee233a76159804bfce97d65058331f718`.
+
+## Git workflow: keep `main` clean
+
+Canonical `Repos/<repo>` stays on a **clean `main`**; do not make or leave
+staged, unstaged or untracked changes there. New code, tests, generated
+userscript releases, staging and commits belong to a registered
+`Worktrees/<repo>/<task>` checkout. Publish task commits using the Fortis
+Gateway and PR, then admit an owner-merged PR into clean Docker `main` via
+`workspace.update_main_from_pr`. Historical dirty state must be preserved and
+verified before moving it into a task; do not erase or hide it with
+`reset --hard`, `git clean` or automatic stash. The shared owner is
+[UC-CONT-019](https://github.com/AlexPastukhh/fortis-container/blob/main/docs/use-cases/worktrees.md#uc-cont-019)
+with [UC-CONT-002/003](https://github.com/AlexPastukhh/fortis-container/blob/main/docs/use-cases/delivery.md).

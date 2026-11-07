@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT — значки вкладок, загрузка файлов и уведомления
 // @namespace    local.chatgpt.tab-notifier
-// @version      5.7.34
+// @version      5.7.35
 // @description  Статусы вкладки + автоотправка файлов + очередь сообщений + отложенная отправка + перетаскиваемые кнопки
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -27,7 +27,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.7.34';
+  const SCRIPT_VERSION = '5.7.35';
 
   const SETTINGS = Object.freeze({
     desktopNotificationEnabled: true,
@@ -5002,6 +5002,9 @@
     let dragState = null;
     let draggedItemId = null;
     let quickLayout = loadQuickLayout();
+    // Read the persisted preference once. Other tabs and temporary viewport
+    // clamps must not reposition this live tab during regular UI refreshes.
+    let preferredPosition = loadPosition();
     let persistedVisibleCount = 20;
     let persistedVisibleChat = null;
     const largePaste = createLargePasteDraft();
@@ -5043,7 +5046,8 @@
     }
 
     function savePosition(position) {
-      try { localStorage.setItem(deps.FLOATING_UI_POSITION_KEY, JSON.stringify(position)); }
+      preferredPosition = { left: position.left, top: position.top };
+      try { localStorage.setItem(deps.FLOATING_UI_POSITION_KEY, JSON.stringify(preferredPosition)); }
       catch (_) {}
     }
 
@@ -5942,9 +5946,9 @@
         if (event.type === 'pointercancel') quickLayout = resizeState.original;
         resizeState = null;
         try { ui.quickResize.releasePointerCapture?.(event.pointerId); } catch (_) {}
+        // A resized/temporarily cramped viewport must not replace the
+        // user's preferred drag position with the clamped display position.
         saveQuickLayout(); applyLayout();
-        const rect = host.getBoundingClientRect();
-        savePosition({left:rect.left, top:rect.top});
       }
       ui.quickResize.addEventListener('pointerup', finishResize);
       ui.quickResize.addEventListener('pointercancel', finishResize);
@@ -6549,12 +6553,12 @@
       const host = ui.host;
       host.style.display = 'block';
 
-      let position = loadPosition();
-      if (!position) {
-        position = chooseInitialPosition();
-        savePosition(position);
-      }
-      setHostPosition(host, position, { persist: true });
+      if (!preferredPosition) savePosition(chooseInitialPosition());
+      // An ordinary render must never persist the viewport-clamped position.
+      // During an active drag, draw at the live pointer location rather than
+      // jumping back to the preference when the periodic UI timer fires.
+      const rect = dragState?.moved ? host.getBoundingClientRect() : null;
+      setHostPosition(host, rect ? { left: rect.left, top: rect.top } : preferredPosition);
 
       const active = tabState.isUploadMarked();
       ui.autoButton.dataset.active = String(active);

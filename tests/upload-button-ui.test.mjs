@@ -111,6 +111,28 @@ test('floating controls preserve valid user position', () => {
   assert.deepEqual(clampFloatingPosition({ left: 123, top: 456 }, 1000, 800), { left: 123, top: 456 });
 });
 
+test('floating textbox keeps saved drag coordinates through transient viewport changes', () => {
+  const implementation = source();
+  assert.match(implementation, /let preferredPosition = loadPosition\(\)/,
+    'position is restored once for the live tab rather than reloaded on every refresh');
+  const render = implementation.slice(implementation.indexOf('    function render() {'),
+    implementation.indexOf('    function schedule() {'));
+  assert.match(render, /if \(!preferredPosition\) savePosition\(chooseInitialPosition\(\)\)/);
+  assert.match(render, /dragState\?\.moved \? host\.getBoundingClientRect\(\) : null/);
+  assert.match(render, /setHostPosition\(host, rect \? \{ left: rect\.left, top: rect\.top \} : preferredPosition\)/);
+  assert.doesNotMatch(render, /persist: true|loadPosition\(\)/,
+    'periodic rendering must never overwrite a preferred location');
+  const resize = implementation.slice(implementation.indexOf('      function finishResize(event) {'),
+    implementation.indexOf("      ui.quickResize.addEventListener('pointerup', finishResize)"));
+  assert.doesNotMatch(resize, /savePosition\(/,
+    'resizing or collapsing the textbox must not save a temporarily clamped position');
+  const preferred = {left:510,top:380};
+  const narrowed = clampFloatingPosition(preferred,320,360,{width:308,height:180});
+  assert.notDeepEqual(narrowed,preferred,'small viewport should visibly clamp');
+  assert.deepEqual(clampFloatingPosition(preferred,960,720,{width:422,height:112}),preferred,
+    'saved preference must be reusable after the window expands');
+});
+
 test('queue UI keeps open Shadow DOM for ChatGPT focus compatibility', () => {
   const text = source();
   assert.match(text, /attachShadow\(\{ mode: 'open' \}\)/);

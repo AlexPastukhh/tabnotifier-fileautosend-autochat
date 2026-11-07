@@ -7,7 +7,14 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 const require=createRequire(import.meta.url);
 const {createTextboxProfileManager,SHARED_MODULE_CHANNEL}=require('../src/textbox-module-profiles.js');
-const {createHelperModuleChannel}=require('../../obs-planning-docs/planning/documentation/tools/tampermonkey/chat-command-palette/src/shared-module-channel.js');
+// Resolve the sibling project from the canonical common Git directory, not
+// from this task's checkout; both Repos/<repo> and Worktrees/<repo>/<task> work.
+const gitCommonDir=require('node:child_process').execFileSync(
+  'git',['rev-parse','--path-format=absolute','--git-common-dir'],
+  {cwd:require('node:path').dirname(require('node:url').fileURLToPath(import.meta.url)),encoding:'utf8'}).trim();
+const helperSource=require('node:path').resolve(gitCommonDir,'..','..','obs-planning-docs',
+  'planning/documentation/tools/tampermonkey/chat-command-palette/src/shared-module-channel.js');
+const {createHelperModuleChannel}=require(helperSource);
 class Channel {
   static all=new Set();
   constructor(name){this.name=name;Channel.all.add(this);}

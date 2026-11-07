@@ -4,7 +4,14 @@ import { createRequire } from 'node:module';
 import { webcrypto } from 'node:crypto';
 const require=createRequire(import.meta.url);
 const {createTextboxProfileManager,normalizeProfiles,resolveSelectedText,TEXTBOX_PROFILE_STORAGE_KEY,SHARED_MODULE_CHANNEL}=require('../src/textbox-module-profiles.js');
-const {createHelperModuleChannel}=require('../../obs-planning-docs/planning/documentation/tools/tampermonkey/chat-command-palette/src/shared-module-channel.js');
+// Resolve the sibling project from the canonical common Git directory, not
+// from this task's checkout; both Repos/<repo> and Worktrees/<repo>/<task> work.
+const gitCommonDir=require('node:child_process').execFileSync(
+  'git',['rev-parse','--path-format=absolute','--git-common-dir'],
+  {cwd:require('node:path').dirname(require('node:url').fileURLToPath(import.meta.url)),encoding:'utf8'}).trim();
+const helperSource=require('node:path').resolve(gitCommonDir,'..','..','obs-planning-docs',
+  'planning/documentation/tools/tampermonkey/chat-command-palette/src/shared-module-channel.js');
+const {createHelperModuleChannel}=require(helperSource);
 const {createPersistentMessageController,createTaskIdBehavior}=require('../src/persisted-messages.js');
 
 class Channel {
