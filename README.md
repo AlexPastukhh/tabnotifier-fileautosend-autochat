@@ -1,5 +1,11 @@
 # ChatGPT Tab Notifier / File Auto-Send / Prompt Queue
 
+Общие Fortis workflow и правила документации —
+[главный реестр](https://github.com/AlexPastukhh/fortis-container/blob/main/docs/use-cases/README.md),
+с обязательным полным чтением UC-CONT-002/003; остальные сценарии — по задаче.
+Будущие улучшения и технический долг — один
+[BACKLOG-IMPROVEMENTS](docs/BACKLOG-IMPROVEMENTS.md).
+
 ## 31.10.2026 — Notifier 5.7.35: закрепление положения панели (SOURCE READY)
 
 При каждом render() старая версия заново читала координаты из localStorage
